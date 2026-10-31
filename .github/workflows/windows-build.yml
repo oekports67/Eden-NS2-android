@@ -1,0 +1,64 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+    inputs:
+      lto:
+        description: "Link-time optimization (faster emulator, build takes longer)"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 300
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install Choco Dependencies
+      shell: cmd
+      run: choco install cmake ninja --installargs "ADD_CMAKE_TO_PATH=System" -y
+
+    - name: Install Vulkan SDK
+      uses: humbletim/install-vulkan-sdk@v1.2
+      with:
+        version: latest
+        cache: true
+
+    - name: Add Vulkan SDK to PATH
+      shell: pwsh
+      run: |
+        echo "$env:VULKAN_SDK\Bin" >> $env:GITHUB_PATH
+        & "$env:VULKAN_SDK\Bin\glslangValidator.exe" --version
+
+    - name: Configure Developer Command Prompt
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+
+    - name: Build with MSVC Script
+      shell: cmd
+      env:
+        EDEN_LTO: ${{ inputs.lto && 'ON' || 'OFF' }}
+      run: build-eden-msvc.bat 4 < NUL
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Eden-NS2-Windows
+        path: |
+          build-msvc-gui-relwithdebinfo/bin/
+          !build-msvc-gui-relwithdebinfo/bin/**/*.pdb
+          !build-msvc-gui-relwithdebinfo/bin/**/*.ilk
+        if-no-files-found: error
+
+    - name: Upload debug symbols
+      uses: actions/upload-artifact@v4
+      with:
+        name: Eden-NS2-Windows-pdb
+        path: build-msvc-gui-relwithdebinfo/bin/**/*.pdb
+        if-no-files-found: ignore

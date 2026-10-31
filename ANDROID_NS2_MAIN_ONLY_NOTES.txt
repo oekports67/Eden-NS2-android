@@ -1,0 +1,25 @@
+Eden-NS2: Android loose ExeFS folder import (main-only experiment)
+===============================================================
+
+How to use:
+  1. In Android Eden, choose "NS2 / ExeFS folder" from the games screen.
+  2. Select either the game root containing exefs/main, or the exefs folder itself.
+  3. main MUST be a valid NSO0 file. main.npdm is OPTIONAL.
+  4. If romfs is present, select the game root to import exefs and romfs together.
+
+Changes to earlier Android Stability build:
+  - NS2 folder detection requires only exefs/main, not main.npdm.
+  - Import-complete checks no longer require main.npdm.
+  - The standalone deconstructed ExeFS loader recognizes an NSO named main
+    within a directory named exefs even without main.npdm.
+  - Standalone ExeFS launch without main.npdm uses generic process metadata
+    instead of failing immediately. This does NOT recreate genuine NS2 NPDM
+    permissions, program IDs, extended ACID data, or other needed features.
+  - Container and NSP/NCA NPDM requirements are not globally weakened.
+
+Limitations:
+  - This is an experimental SOURCE patch, not a tested Android APK.
+  - Games requiring missing metadata, accompanying NSOs or other Switch 2
+    runtime support can still fail or crash.
+  - RomFS is copied, not streamed from SAF; available storage is needed.
+  - No Android device or complete Android SDK/NDK was available to verify launch.

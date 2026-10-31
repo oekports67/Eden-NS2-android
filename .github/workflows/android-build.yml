@@ -1,0 +1,48 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/node_modules
+        df -h /
+
+    - name: Install host tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y glslang-tools ninja-build
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: 17
+
+    - name: Install Android NDK and CMake
+      run: |
+        yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+        "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;28.2.13676358" "cmake;3.31.5"
+
+    - name: Build
+      run: |
+        chmod +x .ci/android/build.sh
+        .ci/android/build.sh -t standard -b Release -DENABLE_WERROR=OFF
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: Eden-NS2-Android
+        path: artifacts/
+        if-no-files-found: error
