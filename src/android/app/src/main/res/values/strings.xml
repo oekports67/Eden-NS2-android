@@ -945,6 +945,17 @@
     <string name="loader_error_encrypted">Your ROM is encrypted</string>
     <string name="loader_error_encrypted_roms_description"><![CDATA[Please follow the guides to redump your <a href=\"https://yuzu-mirror.github.io/help/quickstart/#dumping-physical-titles-game-cards\">game cartridges</a> or <a href=\"https://yuzu-mirror.github.io/help/quickstart/#dumping-digital-titles-eshop\">installed titles</a>.]]></string>
     <string name="loader_error_encrypted_keys_description"><![CDATA[Please ensure your <a href=\"https://yuzu-mirror.github.io/help/quickstart/#dumping-prodkeys-and-titlekeys\">prod.keys</a> file is installed so that games can be decrypted.]]></string>
+    <string name="loader_error_open_game">Unable to open the game</string>
+    <string name="loader_error_open_game_description">The selected file could not be opened as a supported game. For extracted Switch 2 files, choose NS2 / ExeFS folder instead of opening main alone. Check the emulator log for the specific failure.</string>
+    <string name="loader_error_load_game">Unable to load the game</string>
+    <string name="loader_error_load_game_description">The game loader failed. An extracted ExeFS/main is an NSO and does not need decryption, but it must be launched using its ExeFS folder and may need RomFS and companion modules. Check the emulator log. Other encrypted game containers may require valid keys.</string>
+    <string name="loader_error_system">Required system files are unavailable</string>
+    <string name="loader_error_system_description">The emulator could not access a required system file or resource. Check installed firmware and the emulator log.</string>
+    <string name="loader_error_generic">Emulation could not start</string>
+    <string name="loader_error_generic_description">The emulator could not initialize this title. This is not necessarily a decryption error. Check the emulator log for the actual cause.</string>
+    <string name="ns2_standalone_main_title">Select the ExeFS folder</string>
+    <string name="ns2_standalone_main_message">The extracted main file is already an NSO and does not need decryption. Launching it alone omits the companion modules and RomFS. Select the game root folder (with exefs and romfs) or the exefs folder instead.</string>
+    <string name="ns2_choose_exefs_folder">Choose folder</string>
     <string name="loader_error_video_core">An error occurred initializing the video core</string>
     <string name="loader_error_video_core_description">This is usually caused by an incompatible GPU driver. Installing a custom GPU driver may resolve this problem.</string>
     <string name="loader_error_file_not_found">ROM file does not exist</string>
@@ -1888,11 +1899,20 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
     <!-- Android NS2 loose ExeFS folder import -->
-    <string name="ns2_open_folder">NS2 / ExeFS folder</string>
+    <string name="ns2_open_folder">NS2 / ExeFS + RomFS</string>
     <string name="ns2_import_title">Preparing NS2 game folder</string>
     <string name="ns2_import_message">Copying ExeFS and RomFS into app storage. This may use several gigabytes. Do not close Eden.</string>
     <string name="ns2_import_failed">Unable to open NS2 game folder</string>
     <string name="ns2_folder_permission_error">Android did not grant folder access</string>
-    <string name="ns2_no_romfs">No RomFS found. Select the game root containing exefs and romfs for full access.</string>
+    <string name="ns2_no_romfs">No RomFS was imported. Games needing resources may fail.</string>
     <string name="ns2_import_game">Extracted NS2 game</string>
+    <string name="ns2_romfs_step_title">Choose RomFS folder (step 2 of 2)</string>
+    <string name="ns2_romfs_skip_warning">No RomFS folder selected. Games using RomFS data may fail. Select RomFS separately or continue without it.</string>
+    <string name="ns2_choose_romfs">Choose RomFS</string>
+    <string name="ns2_skip_romfs">Skip RomFS</string>
+    <string name="ns2_phase_scanning">Checking selected ExeFS and RomFS folders…</string>
+    <string name="ns2_phase_verifying">Verifying copied game files…</string>
+    <string name="ns2_phase_cached">Already imported — using saved files</string>
+    <string name="ns2_phase_complete">Import complete</string>
+    <string name="ns2_phase_copying">Copied %1$d/%2$d files · %3$d/%4$d MiB</string>
 </resources>

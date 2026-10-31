@@ -398,18 +398,39 @@ object NativeLibrary {
 
         val captionId: Int
         var descriptionId: Int
+        // A loader failure does not imply encryption. In particular, an extracted
+        // ExeFS/main is an NSO and can fail because it was opened without its
+        // companion modules, process context or RomFS. Do not tell users to
+        // decrypt an already-decrypted NSO or reinstall keys for every failure.
         when (resultCode) {
             ErrorVideoCore -> {
                 captionId = R.string.loader_error_video_core
                 descriptionId = R.string.loader_error_video_core_description
             }
 
+            ErrorGetLoader -> {
+                captionId = R.string.loader_error_open_game
+                descriptionId = R.string.loader_error_open_game_description
+            }
+
+            ErrorLoader -> {
+                captionId = R.string.loader_error_load_game
+                descriptionId = R.string.loader_error_load_game_description
+            }
+
+            ErrorSystemFiles, ErrorSharedFont -> {
+                captionId = R.string.loader_error_system
+                descriptionId = R.string.loader_error_system_description
+            }
+
+            ErrorNotInitialized, ErrorUnknown -> {
+                captionId = R.string.loader_error_generic
+                descriptionId = R.string.loader_error_generic_description
+            }
+
             else -> {
-                captionId = R.string.loader_error_encrypted
-                descriptionId = R.string.loader_error_encrypted_roms_description
-                if (!reloadKeys()) {
-                    descriptionId = R.string.loader_error_encrypted_keys_description
-                }
+                captionId = R.string.loader_error_generic
+                descriptionId = R.string.loader_error_generic_description
             }
         }
 

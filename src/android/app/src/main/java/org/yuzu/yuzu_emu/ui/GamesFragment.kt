@@ -15,6 +15,7 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.PopupMenu
 import android.widget.Toast
 import android.widget.ProgressBar
+import android.net.Uri
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -23,6 +24,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import org.yuzu.yuzu_emu.utils.Ns2FolderImport
+import org.yuzu.yuzu_emu.utils.FileUtil
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
@@ -75,6 +77,7 @@ class GamesFragment : Fragment() {
     companion object {
         private const val SEARCH_TEXT = "SearchText"
         private const val PREF_SORT_TYPE = "GamesSortType"
+        private const val NS2_EXEFS_PENDING = "Ns2ExeFsPending"
     }
 
     private val gamesViewModel: GamesViewModel by activityViewModels()
@@ -96,55 +99,138 @@ class GamesFragment : Fragment() {
     private val getGameFile =
         registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
             if (uri == null) return@registerForActivityResult
+            val name = runCatching { FileUtil.getFilename(uri) }.getOrNull()
+                ?.takeIf { it.isNotBlank() }
+                ?: uri.lastPathSegment?.substringAfterLast('/') ?: uri.toString()
+
+            // An extracted NSO is not encrypted, but opening it by itself bypasses
+            // the ExeFS process setup and cannot reach nearby RomFS resources.
+            // Direct users to the existing SAF directory importer instead.
+            if (name == "main") {
+                MaterialAlertDialogBuilder(requireContext())
+                    .setTitle(R.string.ns2_standalone_main_title)
+                    .setMessage(R.string.ns2_standalone_main_message)
+                    .setPositiveButton(R.string.ns2_choose_exefs_folder) { _, _ ->
+                        getNs2ExeFsFolder.launch(null)
+                    }
+                    .setNegativeButton(android.R.string.cancel, null)
+                    .show()
+                return@registerForActivityResult
+            }
+
             try {
                 requireContext().contentResolver.takePersistableUriPermission(
                     uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
                 )
             } catch (_: SecurityException) {
             }
-            val name = uri.lastPathSegment?.substringAfterLast('/') ?: uri.toString()
             val game = Game(title = name, path = uri.toString())
             findNavController().navigate(HomeNavigationDirections.actionGlobalEmulationActivity(game))
         }
 
     private var ns2ImportJob: Job? = null
+    private var pendingExeFsUri: Uri? = null
 
-    // Explicit folder selection, not a single-file picker. Needed for SAF RomFS/ExeFS access.
-    private val getNs2GameFolder =
-        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { selected ->
-            if (selected == null) return@registerForActivityResult
-            try {
-                requireContext().contentResolver.takePersistableUriPermission(
-                    selected, Intent.FLAG_GRANT_READ_URI_PERMISSION
-                )
-            } catch (e: SecurityException) {
-                Toast.makeText(requireContext(), R.string.ns2_folder_permission_error,
-                    Toast.LENGTH_LONG).show()
-                return@registerForActivityResult
-            }
-            importNs2Folder(selected)
+    // Android 11+ grants access to the chosen directory only. Two independent
+    // SAF permissions make ExeFS and RomFS accessible even in different folders.
+    private val getNs2ExeFsFolder =
+        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+            if (uri == null) return@registerForActivityResult
+            if (!persistNs2ReadPermission(uri)) return@registerForActivityResult
+            pendingExeFsUri = uri
+            // Step 2: choose RomFS separately. Cancelling opens an explicit skip
+            // confirmation; it never accidentally launches a partially selected game.
+            getNs2RomFsFolder.launch(null)
         }
 
-    private fun importNs2Folder(selected: android.net.Uri) {
+    private val getNs2RomFsFolder =
+        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+            val exefs = pendingExeFsUri ?: return@registerForActivityResult
+            if (uri != null) {
+                if (!persistNs2ReadPermission(uri)) return@registerForActivityResult
+                pendingExeFsUri = null
+                importNs2Folders(exefs, uri)
+            } else if (isAdded) {
+                MaterialAlertDialogBuilder(requireContext())
+                    .setTitle(R.string.ns2_romfs_step_title)
+                    .setMessage(R.string.ns2_romfs_skip_warning)
+                    .setPositiveButton(R.string.ns2_choose_romfs) { _, _ ->
+                        getNs2RomFsFolder.launch(null)
+                    }
+                    .setNeutralButton(R.string.ns2_skip_romfs) { _, _ ->
+                        pendingExeFsUri = null
+                        importNs2Folders(exefs, null)
+                    }
+                    .setNegativeButton(android.R.string.cancel) { _, _ ->
+                        pendingExeFsUri = null
+                    }
+                    .show()
+            }
+        }
+
+    private fun persistNs2ReadPermission(uri: Uri): Boolean {
+        return try {
+            requireContext().contentResolver.takePersistableUriPermission(
+                uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+            true
+        } catch (e: SecurityException) {
+            Toast.makeText(requireContext(), R.string.ns2_folder_permission_error,
+                Toast.LENGTH_LONG).show()
+            false
+        }
+    }
+
+    private fun importNs2Folders(exefs: Uri, romfs: Uri?) {
         if (ns2ImportJob?.isActive == true) return
         val applicationContext = requireContext().applicationContext
-        val progress = ProgressBar(requireContext())
-        progress.setPadding(48, 28, 48, 28)
+        val progress = ProgressBar(requireContext(), null, android.R.attr.progressBarStyleHorizontal)
+        progress.max = 100
+        progress.isIndeterminate = true
+        progress.setPadding(36, 28, 36, 28)
         val progressDialog = MaterialAlertDialogBuilder(requireContext())
             .setTitle(R.string.ns2_import_title)
             .setMessage(R.string.ns2_import_message)
             .setView(progress)
             .setNegativeButton(android.R.string.cancel) { _, _ -> ns2ImportJob?.cancel() }
             .create()
+        progressDialog.setCanceledOnTouchOutside(false)
         progressDialog.show()
+
         ns2ImportJob = viewLifecycleOwner.lifecycleScope.launch {
             try {
                 val result = withContext(Dispatchers.IO) {
-                    Ns2FolderImport.import(applicationContext, selected)
+                    Ns2FolderImport.import(applicationContext, exefs, romfs) { update ->
+                        withContext(Dispatchers.Main) {
+                            if (!progressDialog.isShowing) return@withContext
+                            progress.isIndeterminate = update.percentage == null
+                            if (update.percentage != null) {
+                                progress.progress = update.percentage
+                            }
+                            val status = when (update.phase) {
+                                Ns2FolderImport.Phase.SCANNING -> getString(R.string.ns2_phase_scanning)
+                                Ns2FolderImport.Phase.VERIFYING -> getString(R.string.ns2_phase_verifying)
+                                Ns2FolderImport.Phase.CACHED -> getString(R.string.ns2_phase_cached)
+                                Ns2FolderImport.Phase.COMPLETE -> getString(R.string.ns2_phase_complete)
+                                Ns2FolderImport.Phase.COPYING -> getString(
+                                    R.string.ns2_phase_copying,
+                                    update.filesCopied,
+                                    update.totalFiles,
+                                    update.bytesCopied / (1024 * 1024),
+                                    update.totalBytes / (1024 * 1024),
+                                )
+                            }
+                            progressDialog.setMessage(status)
+                        }
+                    }
                 }
-                if (result.romfsIncluded.not()) {
+                if (!result.romfsIncluded) {
                     Toast.makeText(requireContext(), R.string.ns2_no_romfs,
                         Toast.LENGTH_LONG).show()
+                }
+                if (result.reused) {
+                    Toast.makeText(requireContext(), R.string.ns2_phase_cached,
+                        Toast.LENGTH_SHORT).show()
                 }
                 val game = Game(title = getString(R.string.ns2_import_game),
                     path = result.mainPath)
@@ -152,9 +238,9 @@ class GamesFragment : Fragment() {
                     HomeNavigationDirections.actionGlobalEmulationActivity(game)
                 )
             } catch (_: CancellationException) {
-                // Cancelling the import deletes the temporary staged directory.
+                // The importer deletes its partial directory on cancellation.
             } catch (e: Exception) {
-                org.yuzu.yuzu_emu.utils.Log.error("[NS2 ExeFS] ${e.message}")
+                org.yuzu.yuzu_emu.utils.Log.error("[NS2 ExeFS/RomFS] ${e.message}")
                 if (isAdded) {
                     MaterialAlertDialogBuilder(requireContext())
                         .setTitle(R.string.ns2_import_failed)
@@ -198,6 +284,7 @@ class GamesFragment : Fragment() {
 
         if (savedInstanceState != null) {
             binding.searchText.setText(savedInstanceState.getString(SEARCH_TEXT))
+            pendingExeFsUri = savedInstanceState.getString(NS2_EXEFS_PENDING)?.let(Uri::parse)
         }
 
         gameAdapter = GameAdapter(
@@ -277,7 +364,7 @@ class GamesFragment : Fragment() {
         }
 
         binding.launchNs2Folder?.setOnClickListener {
-            getNs2GameFolder.launch(null)
+            getNs2ExeFsFolder.launch(null)
         }
 
         binding.launchQlaunch?.setOnClickListener {
@@ -332,6 +419,7 @@ class GamesFragment : Fragment() {
         if (_binding != null) {
             outState.putString(SEARCH_TEXT, binding.searchText.text.toString())
         }
+        pendingExeFsUri?.let { outState.putString(NS2_EXEFS_PENDING, it.toString()) }
     }
 
     override fun onPause() {

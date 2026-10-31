@@ -1,0 +1,732 @@
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/utils/Ns2FolderImport.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/utils/Ns2FolderImport.kt
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/utils/Ns2FolderImport.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/utils/Ns2FolderImport.kt
+@@ -5,9 +5,10 @@
+ 
+ import android.content.Context
+ import android.net.Uri
++import android.os.SystemClock
+ import androidx.documentfile.provider.DocumentFile
++import java.io.DataInputStream
+ import java.io.File
+-import java.io.DataInputStream
+ import java.io.IOException
+ import java.security.MessageDigest
+ import kotlinx.coroutines.currentCoroutineContext
+@@ -15,157 +16,320 @@
+ import org.yuzu.yuzu_emu.getPublicFilesDir
+ 
+ /**
+- * Android Storage Access Framework directory import for loose ExeFS/RomFS dumps.
++ * Stage a selected SAF ExeFS + optional RomFS tree in app-controlled storage.
+  *
+- * A SAF document Uri is NOT a filesystem directory. The native RealVfsFile cannot
+- * discover its siblings (rtld, optional main.npdm, sdk, romfs) from an individual content Uri.
+- * Stage the selected tree under app-controlled storage and launch the real
+- * absolute path to exefs/main, so the existing desktop directory loader works.
+- *
+- * The original user files are read-only and are never removed or changed.
++ * A content:// document has no reliable POSIX parent directory, so passing only
++ * exefs/main to the native RealVfsFile loses the neighbouring RomFS and NSOs.
++ * The original source remains untouched. An interrupted import is never reused.
+  */
+ object Ns2FolderImport {
+-    data class ImportedGame(val mainPath: String, val romfsIncluded: Boolean)
+-
+-    /** Must run on an IO dispatcher, not on Android's main thread. */
+-    suspend fun import(context: Context, selectedUri: Uri): ImportedGame {
+-        val resolver = context.contentResolver
+-        val picked = DocumentFile.fromTreeUri(context, selectedUri)
++    enum class Phase { SCANNING, COPYING, VERIFYING, CACHED, COMPLETE }
++
++    data class ImportProgress(
++        val phase: Phase,
++        val filesCopied: Int = 0,
++        val totalFiles: Int = 0,
++        val bytesCopied: Long = 0,
++        val totalBytes: Long = 0,
++        val currentFile: String = "",
++        val percentage: Int? = null,
++    )
++
++    data class ImportedGame(
++        val mainPath: String,
++        val romfsIncluded: Boolean,
++        val reused: Boolean = false,
++    )
++
++    private const val MARKER_VERSION = "EDEN_NS2_IMPORT_V3_DUAL_TREE"
++    private const val BUFFER_SIZE = 256 * 1024
++    private const val MAX_DEPTH = 64
++
++    private data class SourceFile(val source: DocumentFile, val path: String, val size: Long,
++                                  val modified: Long)
++
++    private class Plan {
++        val folders = linkedSetOf<String>()
++        val files = arrayListOf<SourceFile>()
++        var romfsIncluded = false
++        var completeMetadata = true
++        var totalBytes = 0L
++    }
++
++    /** Call on Dispatchers.IO. Progress callbacks may suspend (e.g. switch to Main). */
++    suspend fun import(
++        context: Context,
++        selectedExeFsUri: Uri,
++        selectedRomFsUri: Uri? = null,
++        onProgress: suspend (ImportProgress) -> Unit = {},
++    ): ImportedGame {
++        currentCoroutineContext().ensureActive()
++        onProgress(ImportProgress(Phase.SCANNING))
++        val picked = DocumentFile.fromTreeUri(context, selectedExeFsUri)
+             ?: throw IOException("The selected folder could not be opened")
+         if (!picked.isDirectory) throw IOException("Select a folder, not a file")
+ 
+-        // Accept <game>/exefs/main, or an exefs folder selected directly.
+-        val exefsSource = if (picked.findFile("main")?.isFile == true) {
+-            picked
+-        } else {
+-            picked.findFile("exefs")
+-        }
+-        if (exefsSource == null || !exefsSource.isDirectory ||
+-            exefsSource.findFile("main")?.isFile != true
+-        ) {
+-            throw IOException("exefs/main not found. Select the game folder or exefs")
+-        }
+-
+-        // An incomplete/incorrect 'main' must be rejected before loading native code.
+-        val mainSource = exefsSource.findFile("main")!!
++        val exefs = if (picked.findFile("main")?.isFile == true) picked
++                    else picked.findFile("exefs")
++        if (exefs == null || !exefs.isDirectory) {
++            throw IOException("exefs/main not found. Select the game root or the exefs folder")
++        }
++        val main = exefs.findFile("main")?.takeIf { it.isFile }
++            ?: throw IOException("exefs/main not found in the selected folder")
+         val magic = ByteArray(4)
+-        resolver.openInputStream(mainSource.uri)?.use { input ->
++        context.contentResolver.openInputStream(main.uri)?.use { stream ->
+             try {
+-                DataInputStream(input).readFully(magic)
++                DataInputStream(stream).readFully(magic)
+             } catch (_: java.io.EOFException) {
+                 throw IOException("exefs/main is truncated")
+             }
+-            if (!magic.contentEquals("NSO0".toByteArray(Charsets.US_ASCII))) {
+-                throw IOException("exefs/main is not a valid NSO file (missing NSO0 magic)")
+-            }
+-        } ?: throw IOException("Unable to read exefs/main (check Android folder permissions)")
+-
+-        // The folder may be many gigabytes: intentionally use app-owned external files
+-        // if available (same partition as user dumps) instead of tiny cacheDir.
++        } ?: throw IOException("Cannot read exefs/main. Check access to the selected folder")
++        if (!magic.contentEquals("NSO0".toByteArray(Charsets.US_ASCII))) {
++            throw IOException("exefs/main is not an NSO (missing NSO0 header)")
++        }
++
++        val plan = Plan()
++        suspend fun scan(dir: DocumentFile, relative: String, depth: Int) {
++            currentCoroutineContext().ensureActive()
++            if (depth > MAX_DEPTH) throw IOException("Too many nested directories")
++            plan.folders.add(relative)
++            for (child in dir.listFiles()) {
++                currentCoroutineContext().ensureActive()
++                val name = safeName(child.name)
++                // A RomFS image is a file, not a loose RomFS directory: the
++                // native loader expects it next to exefs/, not inside romfs/.
++                val path = if (relative == "romfs" && child.isFile &&
++                    name.endsWith(".romfs", ignoreCase = true)) name
++                    else "$relative/$name"
++                if (child.isDirectory) {
++                    scan(child, path, depth + 1)
++                } else if (child.isFile) {
++                    addFile(plan, child, path)
++                } else {
++                    throw IOException("Cannot read a file in $relative")
++                }
++            }
++        }
++
++        scan(exefs, "exefs", 0)
++        // The second SAF picker can point to a RomFS directory that is completely
++        // separate from the ExeFS tree. Only the selected trees are read.
++        // Also accept the historical single-root layout when RomFS was skipped.
++        val romfsSelection = if (selectedRomFsUri != null) {
++            DocumentFile.fromTreeUri(context, selectedRomFsUri)
++                ?: throw IOException("The RomFS folder could not be opened")
++        } else if (picked.uri != exefs.uri) picked else null
++        if (romfsSelection != null) {
++            if (!romfsSelection.isDirectory) throw IOException("Select a RomFS folder")
++            if (romfsSelection.findFile("main")?.isFile == true ||
++                romfsSelection.name.equals("exefs", ignoreCase = true)) {
++                throw IOException("You selected ExeFS again. Choose the RomFS folder")
++            }
++            val nested = romfsSelection.findFile("romfs")
++            val selectedGameRoot = romfsSelection.findFile("exefs")?.isDirectory == true
++            // Selecting a game root with a separate *.romfs image is valid,
++            // but the whole root must never be copied into romfs/ (that would
++            // recursively copy the ExeFS tree as game data).
++            val romfsDir = when {
++                nested?.isDirectory == true -> nested
++                selectedGameRoot -> null
++                else -> romfsSelection
++            }
++            if (nested?.isFile == true && nested.name == "romfs") {
++                addFile(plan, nested, "romfs.romfs")
++            }
++            if (romfsDir != null && romfsDir.uri != exefs.uri) {
++                scan(romfsDir, "romfs", 0)
++            }
++            // *.romfs, NACP and icon files can live at the selected root.
++            // Avoid duplicating entries already found in the RomFS directory.
++            for (entry in romfsSelection.listFiles()) {
++                currentCoroutineContext().ensureActive()
++                if (!entry.isFile || entry.uri == nested?.uri) continue
++                val name = safeName(entry.name)
++                if (name.endsWith(".romfs", ignoreCase = true) ||
++                    name.endsWith(".nacp", ignoreCase = true) ||
++                    name.startsWith("icon_", ignoreCase = true)) {
++                    if (plan.files.none { it.source.uri == entry.uri }) {
++                        addFile(plan, entry, name)
++                    }
++                }
++            }
++            if (selectedRomFsUri != null && selectedGameRoot && romfsDir == null &&
++                plan.files.none { it.path.endsWith(".romfs", ignoreCase = true) }) {
++                throw IOException("No RomFS found in the selected game folder")
++            }
++        }
++        plan.romfsIncluded = plan.files.any {
++            it.path.startsWith("romfs/") || it.path.endsWith(".romfs", ignoreCase = true)
++        }
++        if (selectedRomFsUri != null && !plan.romfsIncluded) {
++            throw IOException("Selected RomFS folder contains no readable files")
++        }
++        if (plan.files.none { it.path == "exefs/main" }) {
++            throw IOException("Cannot locate exefs/main")
++        }
++
++        // Stable fingerprint includes all paths, file metadata and the chosen tree.
++        // SAF providers sometimes report size/mtime as 0. In that case do not reuse
++        // an old import, because we cannot establish that the source is unchanged.
++        val digest = MessageDigest.getInstance("SHA-256")
++        fun hash(value: String) = digest.update(value.toByteArray(Charsets.UTF_8))
++        hash("$MARKER_VERSION\nExeFS:$selectedExeFsUri\nRomFS:${selectedRomFsUri ?: "auto"}\n")
++        plan.folders.sorted().forEach { hash("D:$it\n") }
++        plan.files.sortedBy { it.path }.forEach {
++            hash("F:${it.path}:${it.size}:${it.modified}\n")
++        }
++        val fingerprint = digest.digest().joinToString("") { "%02x".format(it) }
+         val base = File(context.getPublicFilesDir(), "ns2_imports")
+         if (!base.isDirectory && !base.mkdirs()) throw IOException("Cannot create import directory")
+         val key = MessageDigest.getInstance("SHA-256")
+-            .digest(selectedUri.toString().toByteArray(Charsets.UTF_8))
++            .digest("$selectedExeFsUri\n${selectedRomFsUri ?: "auto"}".toByteArray(Charsets.UTF_8))
+             .take(10).joinToString("") { "%02x".format(it) }
+         val dest = File(base, key)
+-        val ready = File(dest, ".ns2_import_complete")
+-        val destMain = File(dest, "exefs/main")
+-        // main.npdm is optional for experimental NS2 ExeFS imports.
+-        if (ready.isFile && destMain.isFile) {
+-            return ImportedGame(destMain.absolutePath, File(dest, "romfs").exists() ||
+-                dest.listFiles()?.any { it.extension.equals("romfs", true) } == true)
+-        }
+-
+-        // Remove only interrupted imports for this same selected tree.
+-        base.listFiles()?.filter { it.name.startsWith(".$key-") &&
+-            it.name.endsWith(".partial") }?.forEach { it.deleteRecursively() }
++        val mainDest = File(dest, "exefs/main")
++        val marker = File(dest, ".ns2_import_complete")
++
++        if (plan.completeMetadata && marker.isFile && mainDest.isFile &&
++            marker.readText() == "$MARKER_VERSION\n$fingerprint\n" && verifyFiles(dest, plan)) {
++            onProgress(ImportProgress(Phase.CACHED, plan.files.size, plan.files.size,
++                                      plan.totalBytes, plan.totalBytes, percentage = 100))
++            return ImportedGame(mainDest.absolutePath, plan.romfsIncluded, reused = true)
++        }
++
++        val available = base.usableSpace
++        // This checks the stated file sizes. Providers reporting unknown sizes may
++        // still exhaust storage; IO errors are surfaced instead of an incomplete boot.
++        if (available > 0 && plan.totalBytes > available - 64L * 1024 * 1024) {
++            throw IOException("Not enough free space to import game (need at least " +
++                              "${plan.totalBytes / (1024 * 1024)} MiB)")
++        }
++
++        // Earlier failed attempts must not be recognized as completed imports.
++        base.listFiles()?.filter {
++            it.name.startsWith(".$key-") && it.name.endsWith(".partial")
++        }?.forEach { it.deleteRecursively() }
+         val temp = File(base, ".$key-${System.nanoTime()}.partial")
+-        if (!temp.mkdirs()) throw IOException("Cannot prepare the import folder")
++        if (!temp.mkdirs()) throw IOException("Cannot create temporary import folder")
++        val expectedSizes = HashMap<String, Long>()
++        var copiedBytes = 0L
++        var copiedFiles = 0
++        var lastUpdate = 0L
++        val sizeBasedProgress = plan.completeMetadata && plan.totalBytes > 0L
++
++        suspend fun progress(force: Boolean, file: String = "") {
++            val now = SystemClock.elapsedRealtime()
++            if (!force && now - lastUpdate < 180L) return
++            lastUpdate = now
++            val percentage = if (sizeBasedProgress) {
++                // 100% only after all output files have been verified.
++                ((copiedBytes.coerceAtMost(plan.totalBytes) * 99) / plan.totalBytes).toInt()
++            } else null
++            onProgress(ImportProgress(Phase.COPYING, copiedFiles, plan.files.size,
++                                      copiedBytes, plan.totalBytes, file, percentage))
++        }
++
+         try {
+-            copyDirectory(context, exefsSource, File(temp, "exefs"), 0)
+-            currentCoroutineContext().ensureActive()
+-
+-            // If user chose game root, copy the RomFS sibling too. The directory
+-            // loader reads it from the parent of exefs. If they chose exefs itself,
+-            // the Android SAF grant does not imply permission to read its parent.
+-            val isExeFsSelection = picked.uri == exefsSource.uri
+-            val romfsSource = if (!isExeFsSelection) picked.findFile("romfs") else null
+-            if (romfsSource != null) {
+-                if (romfsSource.isDirectory) {
+-                    copyDirectory(context, romfsSource, File(temp, "romfs"), 0)
+-                } else if (romfsSource.isFile) {
+-                    copyFile(context, romfsSource, File(temp, "romfs.romfs"))
+-                }
+-            }
+-            if (!isExeFsSelection) {
+-                // ReadRomFS also supports loose *.romfs files. NACP/icons may be
+-                // at the game's root rather than next to main.
+-                picked.listFiles().filter { it.isFile &&
+-                    (it.name?.endsWith(".romfs", ignoreCase = true) == true ||
+-                     it.name?.endsWith(".nacp", ignoreCase = true) == true ||
+-                     it.name?.startsWith("icon_", ignoreCase = true) == true)
+-                }.forEach { file ->
+-                    currentCoroutineContext().ensureActive()
+-                    val name = safeName(file.name)
+-                    copyFile(context, file, File(temp, name))
+-                }
+-            }
+-            if (!File(temp, "exefs/main").isFile) {
+-                throw IOException("ExeFS main could not be copied")
+-            }
+-            File(temp, ".ns2_import_complete").writeText("Eden NS2 SAF import\n")
+-            // All files are visible together only after the complete copy.
+-            if (dest.exists() && !dest.deleteRecursively()) {
+-                throw IOException("Cannot replace the previous import; close the running game")
+-            }
+-            if (!temp.renameTo(dest)) throw IOException("Cannot finalize the imported folder")
+-            return ImportedGame(File(dest, "exefs/main").absolutePath,
+-                File(dest, "romfs").exists() ||
+-                    dest.listFiles()?.any { it.extension.equals("romfs", true) } == true)
++            for (folder in plan.folders) {
++                currentCoroutineContext().ensureActive()
++                if (!File(temp, folder).isDirectory && !File(temp, folder).mkdirs()) {
++                    throw IOException("Cannot create $folder in import directory")
++                }
++            }
++            progress(force = true)
++            for (entry in plan.files) {
++                currentCoroutineContext().ensureActive()
++                val target = File(temp, entry.path)
++                val input = context.contentResolver.openInputStream(entry.source.uri)
++                    ?: throw IOException("Cannot read ${entry.path} from selected folder")
++                var written = 0L
++                input.use { stream ->
++                    target.outputStream().use { output ->
++                        val buffer = ByteArray(BUFFER_SIZE)
++                        while (true) {
++                            currentCoroutineContext().ensureActive()
++                            val count = stream.read(buffer)
++                            if (count == -1) break
++                            if (count == 0) continue
++                            output.write(buffer, 0, count)
++                            written += count
++                            copiedBytes += count
++                            progress(force = false, file = entry.path)
++                        }
++                    }
++                }
++                if (entry.size > 0 && entry.size != written) {
++                    throw IOException("File size changed while importing ${entry.path}")
++                }
++                if (target.length() != written) throw IOException("Incomplete copy: ${entry.path}")
++                expectedSizes[entry.path] = written
++                copiedFiles++
++                progress(force = true, file = entry.path)
++            }
++            onProgress(ImportProgress(Phase.VERIFYING, copiedFiles, plan.files.size,
++                                      copiedBytes, plan.totalBytes))
++            for ((relative, size) in expectedSizes) {
++                currentCoroutineContext().ensureActive()
++                val output = File(temp, relative)
++                if (!output.isFile || output.length() != size) {
++                    throw IOException("Imported file missing or truncated: $relative")
++                }
++            }
++            // Verify the imported main header, not just the original source header.
++            File(temp, "exefs/main").inputStream().use { stream ->
++                val header = ByteArray(4)
++                DataInputStream(stream).readFully(header)
++                if (!header.contentEquals(magic)) throw IOException("Copied NSO header mismatch")
++            }
++            File(temp, ".ns2_import_complete").writeText("$MARKER_VERSION\n$fingerprint\n")
++
++            // Atomic replacement with rollback if final rename fails. Avoid losing
++            // the previous complete import when a new import cannot be installed.
++            val backup = File(base, ".$key-${System.nanoTime()}.backup")
++            val hadPrevious = dest.exists()
++            if (hadPrevious && !dest.renameTo(backup)) {
++                throw IOException("Cannot replace previous import. Close running games")
++            }
++            if (!temp.renameTo(dest)) {
++                if (hadPrevious) backup.renameTo(dest)
++                throw IOException("Cannot finalize imported game folder")
++            }
++            if (hadPrevious) backup.deleteRecursively()
++            onProgress(ImportProgress(Phase.COMPLETE, copiedFiles, plan.files.size,
++                                      copiedBytes, plan.totalBytes, percentage = 100))
++            return ImportedGame(File(dest, "exefs/main").absolutePath, plan.romfsIncluded)
+         } finally {
+             if (temp.exists()) temp.deleteRecursively()
+         }
++    }
++
++    private fun addFile(plan: Plan, source: DocumentFile, path: String) {
++        val size = source.length()
++        val modified = source.lastModified()
++        if (size <= 0 || modified <= 0) plan.completeMetadata = false
++        plan.files.add(SourceFile(source, path, size, modified))
++        if (size > 0) {
++            if (Long.MAX_VALUE - plan.totalBytes < size) {
++                throw IOException("The selected game is too large")
++            }
++            plan.totalBytes += size
++        }
++    }
++
++    private suspend fun verifyFiles(folder: File, plan: Plan): Boolean {
++        for (entry in plan.files) {
++            currentCoroutineContext().ensureActive()
++            val target = File(folder, entry.path)
++            if (!target.isFile || target.length() != entry.size) return false
++        }
++        return true
+     }
+ 
+     private fun safeName(name: String?): String {
+         if (name.isNullOrBlank() || name == "." || name == ".." ||
+             name.contains('/') || name.contains('\\') || name.contains('\u0000')) {
+-            throw IOException("Unsafe or invalid name inside selected folder")
++            throw IOException("Invalid file or directory name inside game folder")
+         }
+         return name
+     }
+-
+-    private suspend fun copyDirectory(context: Context, source: DocumentFile,
+-                                      target: File, depth: Int) {
+-        currentCoroutineContext().ensureActive()
+-        if (depth > 64) throw IOException("Too many nested folders in the game dump")
+-        if (!target.isDirectory && !target.mkdirs()) throw IOException("Cannot create $target")
+-        for (child in source.listFiles()) {
+-            currentCoroutineContext().ensureActive()
+-            val output = File(target, safeName(child.name))
+-            if (child.isDirectory) {
+-                copyDirectory(context, child, output, depth + 1)
+-            } else if (child.isFile) {
+-                copyFile(context, child, output)
+-            }
+-        }
+-    }
+-
+-    private suspend fun copyFile(context: Context, source: DocumentFile, target: File) {
+-        currentCoroutineContext().ensureActive()
+-        val resolver = context.contentResolver
+-        val input = resolver.openInputStream(source.uri)
+-            ?: throw IOException("Cannot read ${source.name}. Select a readable game folder")
+-        input.use { stream ->
+-            target.outputStream().use { output ->
+-                val buffer = ByteArray(1024 * 256)
+-                while (true) {
+-                    currentCoroutineContext().ensureActive()
+-                    val count = stream.read(buffer)
+-                    if (count < 0) break
+-                    output.write(buffer, 0, count)
+-                }
+-            }
+-        }
+-    }
+ }
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/ui/GamesFragment.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/ui/GamesFragment.kt
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/ui/GamesFragment.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/ui/GamesFragment.kt
+@@ -15,6 +15,7 @@
+ import android.widget.PopupMenu
+ import android.widget.Toast
+ import android.widget.ProgressBar
++import android.net.Uri
+ import androidx.lifecycle.lifecycleScope
+ import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.Dispatchers
+@@ -76,6 +77,7 @@
+     companion object {
+         private const val SEARCH_TEXT = "SearchText"
+         private const val PREF_SORT_TYPE = "GamesSortType"
++        private const val NS2_EXEFS_PENDING = "Ns2ExeFsPending"
+     }
+ 
+     private val gamesViewModel: GamesViewModel by activityViewModels()
+@@ -109,7 +111,7 @@
+                     .setTitle(R.string.ns2_standalone_main_title)
+                     .setMessage(R.string.ns2_standalone_main_message)
+                     .setPositiveButton(R.string.ns2_choose_exefs_folder) { _, _ ->
+-                        getNs2GameFolder.launch(null)
++                        getNs2ExeFsFolder.launch(null)
+                     }
+                     .setNegativeButton(android.R.string.cancel, null)
+                     .show()
+@@ -127,43 +129,108 @@
+         }
+ 
+     private var ns2ImportJob: Job? = null
+-
+-    // Explicit folder selection, not a single-file picker. Needed for SAF RomFS/ExeFS access.
+-    private val getNs2GameFolder =
+-        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { selected ->
+-            if (selected == null) return@registerForActivityResult
+-            try {
+-                requireContext().contentResolver.takePersistableUriPermission(
+-                    selected, Intent.FLAG_GRANT_READ_URI_PERMISSION
+-                )
+-            } catch (e: SecurityException) {
+-                Toast.makeText(requireContext(), R.string.ns2_folder_permission_error,
+-                    Toast.LENGTH_LONG).show()
+-                return@registerForActivityResult
+-            }
+-            importNs2Folder(selected)
+-        }
+-
+-    private fun importNs2Folder(selected: android.net.Uri) {
++    private var pendingExeFsUri: Uri? = null
++
++    // Android 11+ grants access to the chosen directory only. Two independent
++    // SAF permissions make ExeFS and RomFS accessible even in different folders.
++    private val getNs2ExeFsFolder =
++        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
++            if (uri == null) return@registerForActivityResult
++            if (!persistNs2ReadPermission(uri)) return@registerForActivityResult
++            pendingExeFsUri = uri
++            // Step 2: choose RomFS separately. Cancelling opens an explicit skip
++            // confirmation; it never accidentally launches a partially selected game.
++            getNs2RomFsFolder.launch(null)
++        }
++
++    private val getNs2RomFsFolder =
++        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
++            val exefs = pendingExeFsUri ?: return@registerForActivityResult
++            if (uri != null) {
++                if (!persistNs2ReadPermission(uri)) return@registerForActivityResult
++                pendingExeFsUri = null
++                importNs2Folders(exefs, uri)
++            } else if (isAdded) {
++                MaterialAlertDialogBuilder(requireContext())
++                    .setTitle(R.string.ns2_romfs_step_title)
++                    .setMessage(R.string.ns2_romfs_skip_warning)
++                    .setPositiveButton(R.string.ns2_choose_romfs) { _, _ ->
++                        getNs2RomFsFolder.launch(null)
++                    }
++                    .setNeutralButton(R.string.ns2_skip_romfs) { _, _ ->
++                        pendingExeFsUri = null
++                        importNs2Folders(exefs, null)
++                    }
++                    .setNegativeButton(android.R.string.cancel) { _, _ ->
++                        pendingExeFsUri = null
++                    }
++                    .show()
++            }
++        }
++
++    private fun persistNs2ReadPermission(uri: Uri): Boolean {
++        return try {
++            requireContext().contentResolver.takePersistableUriPermission(
++                uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
++            )
++            true
++        } catch (e: SecurityException) {
++            Toast.makeText(requireContext(), R.string.ns2_folder_permission_error,
++                Toast.LENGTH_LONG).show()
++            false
++        }
++    }
++
++    private fun importNs2Folders(exefs: Uri, romfs: Uri?) {
+         if (ns2ImportJob?.isActive == true) return
+         val applicationContext = requireContext().applicationContext
+-        val progress = ProgressBar(requireContext())
+-        progress.setPadding(48, 28, 48, 28)
++        val progress = ProgressBar(requireContext(), null, android.R.attr.progressBarStyleHorizontal)
++        progress.max = 100
++        progress.isIndeterminate = true
++        progress.setPadding(36, 28, 36, 28)
+         val progressDialog = MaterialAlertDialogBuilder(requireContext())
+             .setTitle(R.string.ns2_import_title)
+             .setMessage(R.string.ns2_import_message)
+             .setView(progress)
+             .setNegativeButton(android.R.string.cancel) { _, _ -> ns2ImportJob?.cancel() }
+             .create()
++        progressDialog.setCanceledOnTouchOutside(false)
+         progressDialog.show()
++
+         ns2ImportJob = viewLifecycleOwner.lifecycleScope.launch {
+             try {
+                 val result = withContext(Dispatchers.IO) {
+-                    Ns2FolderImport.import(applicationContext, selected)
+-                }
+-                if (result.romfsIncluded.not()) {
++                    Ns2FolderImport.import(applicationContext, exefs, romfs) { update ->
++                        withContext(Dispatchers.Main) {
++                            if (!progressDialog.isShowing) return@withContext
++                            progress.isIndeterminate = update.percentage == null
++                            if (update.percentage != null) {
++                                progress.progress = update.percentage
++                            }
++                            val status = when (update.phase) {
++                                Ns2FolderImport.Phase.SCANNING -> getString(R.string.ns2_phase_scanning)
++                                Ns2FolderImport.Phase.VERIFYING -> getString(R.string.ns2_phase_verifying)
++                                Ns2FolderImport.Phase.CACHED -> getString(R.string.ns2_phase_cached)
++                                Ns2FolderImport.Phase.COMPLETE -> getString(R.string.ns2_phase_complete)
++                                Ns2FolderImport.Phase.COPYING -> getString(
++                                    R.string.ns2_phase_copying,
++                                    update.filesCopied,
++                                    update.totalFiles,
++                                    update.bytesCopied / (1024 * 1024),
++                                    update.totalBytes / (1024 * 1024),
++                                )
++                            }
++                            progressDialog.setMessage(status)
++                        }
++                    }
++                }
++                if (!result.romfsIncluded) {
+                     Toast.makeText(requireContext(), R.string.ns2_no_romfs,
+                         Toast.LENGTH_LONG).show()
++                }
++                if (result.reused) {
++                    Toast.makeText(requireContext(), R.string.ns2_phase_cached,
++                        Toast.LENGTH_SHORT).show()
+                 }
+                 val game = Game(title = getString(R.string.ns2_import_game),
+                     path = result.mainPath)
+@@ -171,9 +238,9 @@
+                     HomeNavigationDirections.actionGlobalEmulationActivity(game)
+                 )
+             } catch (_: CancellationException) {
+-                // Cancelling the import deletes the temporary staged directory.
++                // The importer deletes its partial directory on cancellation.
+             } catch (e: Exception) {
+-                org.yuzu.yuzu_emu.utils.Log.error("[NS2 ExeFS] ${e.message}")
++                org.yuzu.yuzu_emu.utils.Log.error("[NS2 ExeFS/RomFS] ${e.message}")
+                 if (isAdded) {
+                     MaterialAlertDialogBuilder(requireContext())
+                         .setTitle(R.string.ns2_import_failed)
+@@ -217,6 +284,7 @@
+ 
+         if (savedInstanceState != null) {
+             binding.searchText.setText(savedInstanceState.getString(SEARCH_TEXT))
++            pendingExeFsUri = savedInstanceState.getString(NS2_EXEFS_PENDING)?.let(Uri::parse)
+         }
+ 
+         gameAdapter = GameAdapter(
+@@ -296,7 +364,7 @@
+         }
+ 
+         binding.launchNs2Folder?.setOnClickListener {
+-            getNs2GameFolder.launch(null)
++            getNs2ExeFsFolder.launch(null)
+         }
+ 
+         binding.launchQlaunch?.setOnClickListener {
+@@ -351,6 +419,7 @@
+         if (_binding != null) {
+             outState.putString(SEARCH_TEXT, binding.searchText.text.toString())
+         }
++        pendingExeFsUri?.let { outState.putString(NS2_EXEFS_PENDING, it.toString()) }
+     }
+ 
+     override fun onPause() {
+diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
+--- a/src/android/app/src/main/res/values/strings.xml
++++ b/src/android/app/src/main/res/values/strings.xml
+@@ -1899,11 +1899,20 @@
+ 
+ 
+     <!-- Android NS2 loose ExeFS folder import -->
+-    <string name="ns2_open_folder">NS2 / ExeFS folder</string>
++    <string name="ns2_open_folder">NS2 / ExeFS + RomFS</string>
+     <string name="ns2_import_title">Preparing NS2 game folder</string>
+     <string name="ns2_import_message">Copying ExeFS and RomFS into app storage. This may use several gigabytes. Do not close Eden.</string>
+     <string name="ns2_import_failed">Unable to open NS2 game folder</string>
+     <string name="ns2_folder_permission_error">Android did not grant folder access</string>
+-    <string name="ns2_no_romfs">No RomFS found. Select the game root containing exefs and romfs for full access.</string>
++    <string name="ns2_no_romfs">No RomFS was imported. Games needing resources may fail.</string>
+     <string name="ns2_import_game">Extracted NS2 game</string>
++    <string name="ns2_romfs_step_title">Choose RomFS folder (step 2 of 2)</string>
++    <string name="ns2_romfs_skip_warning">No RomFS folder selected. Games using RomFS data may fail. Select RomFS separately or continue without it.</string>
++    <string name="ns2_choose_romfs">Choose RomFS</string>
++    <string name="ns2_skip_romfs">Skip RomFS</string>
++    <string name="ns2_phase_scanning">Checking selected ExeFS and RomFS folders…</string>
++    <string name="ns2_phase_verifying">Verifying copied game files…</string>
++    <string name="ns2_phase_cached">Already imported — using saved files</string>
++    <string name="ns2_phase_complete">Import complete</string>
++    <string name="ns2_phase_copying">Copied %1$d/%2$d files · %3$d/%4$d MiB</string>
+ </resources>
+diff --git a/src/android/app/src/main/res/values-ru/strings.xml b/src/android/app/src/main/res/values-ru/strings.xml
+--- a/src/android/app/src/main/res/values-ru/strings.xml
++++ b/src/android/app/src/main/res/values-ru/strings.xml
+@@ -1251,11 +1251,20 @@
+ 
+ 
+     <!-- Android NS2 loose ExeFS folder import -->
+-    <string name="ns2_open_folder">NS2 / папка ExeFS</string>
++    <string name="ns2_open_folder">NS2 / ExeFS + RomFS</string>
+     <string name="ns2_import_title">Подготовка папки игры NS2</string>
+     <string name="ns2_import_message">Копирование ExeFS и RomFS в папку приложения. Может потребоваться несколько гигабайт свободного места.</string>
+     <string name="ns2_import_failed">Не удалось открыть папку NS2</string>
+     <string name="ns2_folder_permission_error">Android не предоставил доступ к папке</string>
+-    <string name="ns2_no_romfs">RomFS не найдена. Для полного доступа выберите папку игры с exefs и romfs.</string>
++    <string name="ns2_no_romfs">RomFS не импортирована. Игры с ресурсами RomFS могут не запуститься.</string>
+     <string name="ns2_import_game">Распакованная игра NS2</string>
++    <string name="ns2_romfs_step_title">Выбор RomFS — шаг 2 из 2</string>
++    <string name="ns2_romfs_skip_warning">Папка RomFS не выбрана. Игры, использующие её данные, могут не запуститься. Выберите RomFS отдельно или продолжите без неё.</string>
++    <string name="ns2_choose_romfs">Выбрать RomFS</string>
++    <string name="ns2_skip_romfs">Без RomFS</string>
++    <string name="ns2_phase_scanning">Проверка папок ExeFS и RomFS…</string>
++    <string name="ns2_phase_verifying">Проверка скопированных файлов…</string>
++    <string name="ns2_phase_cached">Импорт уже готов — используем сохранённые файлы</string>
++    <string name="ns2_phase_complete">Импорт завершён</string>
++    <string name="ns2_phase_copying">Скопировано файлов: %1$d/%2$d · %3$d/%4$d МиБ</string>
+ </resources>
+diff --git a/ANDROID_NS2_DUAL_FOLDER_README.md b/ANDROID_NS2_DUAL_FOLDER_README.md
+new file mode 100644
+--- /dev/null
++++ b/ANDROID_NS2_DUAL_FOLDER_README.md
+@@ -0,0 +1,18 @@
++# Android NS2: two-folder ExeFS / RomFS launch
++
++The Android games screen includes **NS2 / ExeFS + RomFS**.
++
++1. Tap it and choose the **ExeFS** directory (containing `main`, optionally `rtld`, `sdk`, `subsdk*`, etc.). Alternatively choose the game's root directory containing `exefs/`.
++2. The Android folder picker opens **again**. Choose the **RomFS** directory, which may be located anywhere on the device. A game root with `romfs/` also works. If RomFS is missing, cancel the second picker, then explicitly choose **Skip RomFS**.
++3. A scan/copy/verification progress dialog appears. The two trees are staged together under `Android/data/dev.eden.eden_emulator/files/ns2_imports/` using a temporary `.partial` directory. The sources are not changed. On success the emulator launches the staged `exefs/main` with sibling `romfs/` (or a loose `.romfs` image).
++
++- `main.npdm` is **not required** by this Android importer. The header of `exefs/main` must be `NSO0`; there is no requirement for a `.nso` filename extension.
++- A single loose `main` chosen from the ordinary file picker is not enough: please use the NS2 folder flow.
++- If file size and modification timestamps are supplied by the Android document provider, unchanged completed imports are reused on the next selection; imports with missing metadata are copied again to avoid silently reusing outdated data.
++- Large RomFS folders require enough space for a **copy** in the app data directory. The current native loader is not wired to read the raw SAF directory directly. Selecting a separate folder does not eliminate storage requirements.
++- On cancellation/error, temporary partial imports are removed. An existing completed import is left intact until a replacement is successfully prepared.
++- Filesystem access fixes do **not** establish full Switch 2 emulation compatibility; CPU/GPU or OS service support can still prevent games from booting.
++
++## Build / verification
++
++Source files were statically checked for consistency, and the ZIP archive passed CRC checks. The environment does not have a complete Android build toolchain/Gradle distribution, so **APK compilation and execution on a device were not verified**.

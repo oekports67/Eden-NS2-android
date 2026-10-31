@@ -265,8 +265,9 @@ AppLoader_NSO::LoadResult AppLoader_NSO::Load(Kernel::KProcess& process, Core::S
     const VAddr base_address = GetInteger(process.GetEntryPoint());
     if (base_address == 0) {
         LOG_ERROR(Loader, "Cannot launch a standalone NSO without an initialized process. "
-                          "Import a complete game container or ExeFS directory with main.npdm "
-                          "and its companion modules instead of selecting 'main' alone.");
+                          "The NSO is already decrypted; choose the complete ExeFS directory "
+                          "(main.npdm optional for experimental NS2 imports) so the companion "
+                          "modules and RomFS can be discovered instead of selecting 'main' alone.");
         return {ResultStatus::ErrorLoadingNSO, {}};
     }
     if (!LoadModule(process, system, *file, base_address, true, true)) {

@@ -1251,11 +1251,20 @@
 
 
     <!-- Android NS2 loose ExeFS folder import -->
-    <string name="ns2_open_folder">NS2 / папка ExeFS</string>
+    <string name="ns2_open_folder">NS2 / ExeFS + RomFS</string>
     <string name="ns2_import_title">Подготовка папки игры NS2</string>
     <string name="ns2_import_message">Копирование ExeFS и RomFS в папку приложения. Может потребоваться несколько гигабайт свободного места.</string>
     <string name="ns2_import_failed">Не удалось открыть папку NS2</string>
     <string name="ns2_folder_permission_error">Android не предоставил доступ к папке</string>
-    <string name="ns2_no_romfs">RomFS не найдена. Для полного доступа выберите папку игры с exefs и romfs.</string>
+    <string name="ns2_no_romfs">RomFS не импортирована. Игры с ресурсами RomFS могут не запуститься.</string>
     <string name="ns2_import_game">Распакованная игра NS2</string>
+    <string name="ns2_romfs_step_title">Выбор RomFS — шаг 2 из 2</string>
+    <string name="ns2_romfs_skip_warning">Папка RomFS не выбрана. Игры, использующие её данные, могут не запуститься. Выберите RomFS отдельно или продолжите без неё.</string>
+    <string name="ns2_choose_romfs">Выбрать RomFS</string>
+    <string name="ns2_skip_romfs">Без RomFS</string>
+    <string name="ns2_phase_scanning">Проверка папок ExeFS и RomFS…</string>
+    <string name="ns2_phase_verifying">Проверка скопированных файлов…</string>
+    <string name="ns2_phase_cached">Импорт уже готов — используем сохранённые файлы</string>
+    <string name="ns2_phase_complete">Импорт завершён</string>
+    <string name="ns2_phase_copying">Скопировано файлов: %1$d/%2$d · %3$d/%4$d МиБ</string>
 </resources>
