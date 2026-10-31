@@ -55,6 +55,7 @@
 #include "core/hle/service/sm/sm.h"
 #include "core/internal_network/network.h"
 #include "core/loader/loader.h"
+#include "core/loader/nso.h"
 #include "core/memory.h"
 #include "core/memory/cheat_engine.h"
 #include "core/perf_stats.h"
@@ -117,8 +118,14 @@ bool IsSwitch2Program(const FileSys::VirtualFile& file) {
     const auto dir = file != nullptr ? file->GetContainingDirectory() : nullptr;
     const auto npdm = dir != nullptr ? dir->GetFile("main.npdm") : nullptr;
     FileSys::ProgramMetadata metadata;
-    return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-           metadata.IsSwitch2();
+    if (npdm != nullptr) {
+        return metadata.Load(npdm) == Loader::ResultStatus::Success && metadata.IsSwitch2();
+    }
+    // Experimental NS2 loose ExeFS: 'main' alone provides no NPDM to identify a title.
+    // Only opt into the 12 GiB guest layout for an unpacked exefs/main, not any NSO.
+    // This does not synthesize real Switch 2 permissions/metadata.
+    return file && file->GetName() == "main" && dir && dir->GetName() == "exefs" &&
+           Loader::AppLoader_NSO::IdentifyType(file) == Loader::FileType::NSO;
 }
 
 } // namespace

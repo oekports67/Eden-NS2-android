@@ -130,7 +130,8 @@ object FileUtil {
             }
             val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(uri, docId)
             c = resolver.query(childrenUri, columns, null, null, null)
-            while (c!!.moveToNext()) {
+            if (c == null) return emptyArray()
+            while (c.moveToNext()) {
                 val documentId = c.getString(0)
                 val documentName = c.getString(1)
                 val documentMimeType = c.getString(2)
@@ -151,13 +152,34 @@ object FileUtil {
      * @param path Native content uri path
      * @return bool
      */
+    /** Returns document URIs (not fake filesystem paths) for a granted SAF tree. */
+    @JvmStatic
+    fun getDirectoryEntries(path: String): Array<String> =
+        listFiles(Uri.parse(path)).map { it.uri.toString() }.toTypedArray()
+
+    /** Parent for a document URI inside a SAF tree; never escape the granted tree root. */
+    fun getParentDirectory(path: String): String {
+        val uri = Uri.parse(path)
+        return try {
+            val docId = DocumentsContract.getDocumentId(uri)
+            val rootId = DocumentsContract.getTreeDocumentId(uri)
+            if (docId == rootId || !docId.startsWith(rootId)) {
+                path
+            } else {
+                val parentId = docId.substringBeforeLast('/', "")
+                if (parentId.isEmpty() || parentId.length < rootId.length) path
+                else DocumentsContract.buildDocumentUriUsingTree(uri, parentId).toString()
+            }
+        } catch (_: Exception) { path }
+    }
+
     fun exists(path: String?, suppressLog: Boolean = false): Boolean {
         var c: Cursor? = null
         try {
             val mUri = Uri.parse(path)
             val columns = arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
             c = context.contentResolver.query(mUri, columns, null, null, null)
-            return c!!.count > 0
+            return (c?.count ?: 0) > 0
         } catch (e: Exception) {
             if (!suppressLog) {
                 Log.info("[FileUtil] Cannot find file from given path, error: " + e.message)
@@ -183,9 +205,10 @@ object FileUtil {
         try {
             val mUri = Uri.parse(path)
             c = resolver.query(mUri, columns, null, null, null)
-            c!!.moveToNext()
-            val mimeType = c.getString(0)
-            isDirectory = mimeType == DocumentsContract.Document.MIME_TYPE_DIR
+            if (c?.moveToFirst() == true) {
+                val mimeType = c.getString(0)
+                isDirectory = mimeType == DocumentsContract.Document.MIME_TYPE_DIR
+            }
         } catch (e: Exception) {
             Log.error("[FileUtil]: Cannot list files, error: " + e.message)
         } finally {

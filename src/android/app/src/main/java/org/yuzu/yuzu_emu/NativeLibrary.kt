@@ -106,7 +106,7 @@ object NativeLibrary {
         if (DocumentsTree.isNativePath(path)) {
             YuzuApplication.documentsTree!!.getParentDirectory(path)
         } else {
-            path
+            FileUtil.getParentDirectory(path)
         }
 
     @Keep
@@ -116,6 +116,17 @@ object NativeLibrary {
             YuzuApplication.documentsTree!!.getFilename(path)
         } else {
             FileUtil.getFilename(Uri.parse(path))
+        }
+
+    /** Directory child document URIs for native VFS (SAF-backed files). */
+    @Keep
+    @JvmStatic
+    fun getDirectoryEntries(path: String): Array<String> =
+        if (DocumentsTree.isNativePath(path)) {
+            // Native paths are enumerated directly by C++ std::filesystem.
+            emptyArray()
+        } else {
+            FileUtil.getDirectoryEntries(path)
         }
 
     @Keep

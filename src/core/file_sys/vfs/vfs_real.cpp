@@ -313,7 +313,13 @@ RealVfsFile::RealVfsFile(RealVfsFilesystem& base_, std::unique_ptr<FileReference
                          std::optional<std::string> parent_path_)
     : base(base_), reference(std::move(reference_)), path(path_),
       parent_path(parent_path_ ? std::move(*parent_path_) : FS::GetParentPath(path_)),
-      path_components(FS::SplitPathComponentsCopy(path_)), size(size_), perms(perms_) {}
+      path_components(FS::SplitPathComponentsCopy(path_)), size(size_), perms(perms_) {
+#ifdef __ANDROID__
+    if (FS::Android::IsContentUri(path) && !parent_path_) {
+        parent_path = FS::Android::GetParentDirectory(path);
+    }
+#endif
+}
 
 RealVfsFile::~RealVfsFile() {
     base.DropReference(std::move(reference));
@@ -386,6 +392,23 @@ std::vector<VirtualFile> RealVfsDirectory::IterateEntries<RealVfsFile, VfsFile>(
 
     std::vector<VirtualFile> out;
 
+#ifdef __ANDROID__
+    if (FS::Android::IsContentUri(path)) {
+        LOG_INFO(Common_Filesystem, "SAF VFS listing files in {}", path);
+        const auto entries = FS::Android::GetDirectoryEntries(path);
+        LOG_INFO(Common_Filesystem, "SAF VFS got {} entries from {}", entries.size(), path);
+        for (const auto& entry : entries) {
+            if (!FS::Android::IsDirectory(entry)) {
+                LOG_INFO(Common_Filesystem, "SAF VFS querying size for {}", entry);
+                const auto entry_size = FS::Android::GetSize(entry);
+                LOG_INFO(Common_Filesystem, "SAF VFS size={} for {}", entry_size, entry);
+                out.emplace_back(base.OpenFileFromEntry(entry, entry_size, path, perms));
+            }
+        }
+        return out;
+    }
+#endif
+
     const FS::DirEntryCallable callback = [this,
                                            &out](const std::filesystem::directory_entry& entry) {
         const auto full_path_string = FS::PathToUTF8String(entry.path());
@@ -408,6 +431,17 @@ std::vector<VirtualDir> RealVfsDirectory::IterateEntries<RealVfsDirectory, VfsDi
 
     std::vector<VirtualDir> out;
 
+#ifdef __ANDROID__
+    if (FS::Android::IsContentUri(path)) {
+        for (const auto& entry : FS::Android::GetDirectoryEntries(path)) {
+            if (FS::Android::IsDirectory(entry)) {
+                out.emplace_back(base.OpenDirectory(entry, perms));
+            }
+        }
+        return out;
+    }
+#endif
+
     const FS::DirEntryCallable callback = [this,
                                            &out](const std::filesystem::directory_entry& entry) {
         const auto full_path_string = FS::PathToUTF8String(entry.path());
@@ -426,6 +460,12 @@ RealVfsDirectory::RealVfsDirectory(RealVfsFilesystem& base_, const std::string& 
                                    OpenMode perms_)
     : base(base_), path(FS::RemoveTrailingSlash(path_)), parent_path(FS::GetParentPath(path)),
       path_components(FS::SplitPathComponentsCopy(path)), perms(perms_) {
+#ifdef __ANDROID__
+    if (FS::Android::IsContentUri(path)) {
+        parent_path = FS::Android::GetParentDirectory(path);
+        return; // SAF provider owns the directory; never mkdir a content URI.
+    }
+#endif
     if (!FS::Exists(path) && True(perms & OpenMode::Write)) {
         void(FS::CreateDirs(path));
     }
@@ -434,6 +474,17 @@ RealVfsDirectory::RealVfsDirectory(RealVfsFilesystem& base_, const std::string& 
 RealVfsDirectory::~RealVfsDirectory() = default;
 
 VirtualFile RealVfsDirectory::GetFileRelative(std::string_view relative_path) const {
+#ifdef __ANDROID__
+    if (FS::Android::IsContentUri(path)) {
+        for (const auto& entry : FS::Android::GetDirectoryEntries(path)) {
+            if (FS::Android::GetFilename(entry) == relative_path &&
+                !FS::Android::IsDirectory(entry)) {
+                return base.OpenFileFromEntry(entry, FS::Android::GetSize(entry), path, perms);
+            }
+        }
+        return nullptr;
+    }
+#endif
     const auto full_path = FS::SanitizePath(path + '/' + std::string(relative_path));
     if (!FS::Exists(full_path) || FS::IsDir(full_path)
         || !IsWithinRoot(FS::SanitizePath(path), full_path)) {
@@ -443,6 +494,17 @@ VirtualFile RealVfsDirectory::GetFileRelative(std::string_view relative_path) co
 }
 
 VirtualDir RealVfsDirectory::GetDirectoryRelative(std::string_view relative_path) const {
+#ifdef __ANDROID__
+    if (FS::Android::IsContentUri(path)) {
+        for (const auto& entry : FS::Android::GetDirectoryEntries(path)) {
+            if (FS::Android::GetFilename(entry) == relative_path &&
+                FS::Android::IsDirectory(entry)) {
+                return base.OpenDirectory(entry, perms);
+            }
+        }
+        return nullptr;
+    }
+#endif
     const auto full_path = FS::SanitizePath(path + '/' + std::string(relative_path));
     if (!FS::Exists(full_path) || !FS::IsDir(full_path)
         || !IsWithinRoot(FS::SanitizePath(path), full_path)) {
@@ -517,14 +579,24 @@ bool RealVfsDirectory::IsReadable() const {
 }
 
 std::string RealVfsDirectory::GetName() const {
+#ifdef __ANDROID__
+    if (FS::Android::IsContentUri(path)) {
+        return FS::Android::GetFilename(path);
+    }
+#endif
     return path_components.empty() ? "" : std::string(path_components.back());
 }
 
 VirtualDir RealVfsDirectory::GetParentDirectory() const {
+#ifdef __ANDROID__
+    if (FS::Android::IsContentUri(path)) {
+        return parent_path.empty() || parent_path == path
+                   ? nullptr : base.OpenDirectory(parent_path, perms);
+    }
+#endif
     if (path_components.size() <= 1) {
         return nullptr;
     }
-
     return base.OpenDirectory(parent_path, perms);
 }
 

@@ -55,6 +55,14 @@ object DirectoryInitialization {
             Log.warning("Unable to canonicalize Eden data directory; using absolute path: ${e.message}")
             directory.absolutePath
         }
+        // FS::SetEdenPath expects parent directories to exist. Otherwise shader
+        // cache creation, load and TAS paths repeatedly fail on a fresh Android install.
+        for (relative in listOf("cache", "cache/shader", "load", "tas", "config", "nand", "sdmc")) {
+            val folder = java.io.File(directory, relative)
+            if ((!folder.isDirectory && !folder.mkdirs()) || !folder.isDirectory) {
+                throw IOException("Cannot create Eden directory: $folder")
+            }
+        }
         userPath = resolvedPath
         NativeLibrary.setAppDirectory(resolvedPath)
     }

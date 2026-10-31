@@ -366,23 +366,27 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
 ResultStatus AppLoader_DeconstructedRomDirectory::ReadRomFS(FileSys::VirtualFile& out_dir) {
     if (romfs == nullptr && standalone) {
         const auto directory = file->GetContainingDirectory();
-        for (const auto& entry : directory->GetFiles()) {
-            if (entry->GetExtension() == "romfs") {
-                romfs = entry;
-                break;
+        // The Android importer preserves the sibling RomFS in the game root.
+        // Search the ExeFS folder AND its parent (the latter was previously omitted).
+        auto find_romfs_file = [](const FileSys::VirtualDir& candidate) -> FileSys::VirtualFile {
+            if (!candidate) return nullptr;
+            for (const auto& entry : candidate->GetFiles()) {
+                if (entry->GetExtension() == "romfs") return entry;
             }
+            return nullptr;
+        };
+        const auto parent = directory && directory->GetName() == "exefs"
+                                ? directory->GetParentDirectory() : nullptr;
+        romfs = find_romfs_file(directory);
+        if (!romfs) romfs = find_romfs_file(parent);
+        if (!romfs) {
+            auto loose = directory ? directory->GetSubdirectory("romfs") : nullptr;
+            if (!loose && parent) loose = parent->GetSubdirectory("romfs");
+            if (loose) romfs = FileSys::CreateRomFS(std::move(loose));
         }
-        if (romfs == nullptr) {
-            auto loose = directory->GetSubdirectory("romfs");
-            if (!loose && directory->GetName() == "exefs") {
-                const auto parent = directory->GetParentDirectory();
-                if (parent) {
-                    loose = parent->GetSubdirectory("romfs");
-                }
-            }
-            if (loose) {
-                romfs = FileSys::CreateRomFS(std::move(loose));
-            }
+        if (!romfs) {
+            LOG_WARNING(Loader, "Loose ExeFS has no accessible RomFS (checked ExeFS and parent). "
+                                "Games requiring RomFS cannot start without game resources.");
         }
     }
     if (romfs == nullptr) {
