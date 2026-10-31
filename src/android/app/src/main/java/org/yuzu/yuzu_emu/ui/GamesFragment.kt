@@ -25,6 +25,7 @@ import kotlinx.coroutines.withContext
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import org.yuzu.yuzu_emu.utils.Ns2FolderImport
 import org.yuzu.yuzu_emu.utils.FileUtil
+import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
@@ -143,7 +144,7 @@ class GamesFragment : Fragment() {
             getNs2RomFsFolder.launch(null)
         }
 
-    private val getNs2RomFsFolder =
+    private val getNs2RomFsFolder: ActivityResultLauncher<Uri?> =
         registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
             val exefs = pendingExeFsUri ?: return@registerForActivityResult
             if (uri != null) {
