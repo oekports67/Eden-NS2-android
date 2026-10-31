@@ -276,7 +276,7 @@ class GamesFragment : Fragment() {
             getGameFile.launch(arrayOf("*/*"))
         }
 
-        binding.launchNs2Folder.setOnClickListener {
+        binding.launchNs2Folder?.setOnClickListener {
             getNs2GameFolder.launch(null)
         }
 
@@ -616,7 +616,7 @@ class GamesFragment : Fragment() {
 
         binding.addDirectory.visibility = if (showFolder) View.VISIBLE else View.GONE
         binding.launchFile.visibility = if (showFolder) View.VISIBLE else View.GONE
-        binding.launchNs2Folder.visibility = if (showFolder) View.VISIBLE else View.GONE
+        binding.launchNs2Folder?.visibility = if (showFolder) View.VISIBLE else View.GONE
     }
 
     private fun setInsets() =

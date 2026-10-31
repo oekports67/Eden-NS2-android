@@ -1,0 +1,48 @@
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/ui/GamesFragment.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/ui/GamesFragment.kt
+index 184081d..5eb684c 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/ui/GamesFragment.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/ui/GamesFragment.kt
+@@ -276,7 +276,7 @@ class GamesFragment : Fragment() {
+             getGameFile.launch(arrayOf("*/*"))
+         }
+ 
+-        binding.launchNs2Folder.setOnClickListener {
++        binding.launchNs2Folder?.setOnClickListener {
+             getNs2GameFolder.launch(null)
+         }
+ 
+@@ -616,7 +616,7 @@ class GamesFragment : Fragment() {
+ 
+         binding.addDirectory.visibility = if (showFolder) View.VISIBLE else View.GONE
+         binding.launchFile.visibility = if (showFolder) View.VISIBLE else View.GONE
+-        binding.launchNs2Folder.visibility = if (showFolder) View.VISIBLE else View.GONE
++        binding.launchNs2Folder?.visibility = if (showFolder) View.VISIBLE else View.GONE
+     }
+ 
+     private fun setInsets() =
+diff --git a/src/android/app/src/main/res/layout-land/fragment_games.xml b/src/android/app/src/main/res/layout-land/fragment_games.xml
+index fdb951e..9f3095f 100644
+--- a/src/android/app/src/main/res/layout-land/fragment_games.xml
++++ b/src/android/app/src/main/res/layout-land/fragment_games.xml
+@@ -276,4 +276,20 @@
+         app:rippleColor="#99FFFFFF"
+         />
+ 
++    <com.google.android.material.floatingactionbutton.ExtendedFloatingActionButton
++        android:id="@+id/launch_ns2_folder"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_marginEnd="16dp"
++        android:layout_marginBottom="8dp"
++        android:contentDescription="@string/ns2_open_folder"
++        android:text="@string/ns2_open_folder"
++        app:icon="@drawable/ic_play"
++        app:layout_constraintBottom_toTopOf="@id/launch_file"
++        app:layout_constraintEnd_toEndOf="parent"
++        android:textColor="?attr/colorOnPrimary"
++        app:backgroundTint="?attr/colorPrimary"
++        app:iconTint="?attr/colorOnPrimary"
++        app:rippleColor="#99FFFFFF" />
++
+ </androidx.constraintlayout.widget.ConstraintLayout>
+\ No newline at end of file
