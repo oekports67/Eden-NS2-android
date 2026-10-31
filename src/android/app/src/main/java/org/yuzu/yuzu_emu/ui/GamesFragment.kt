@@ -141,7 +141,7 @@ class GamesFragment : Fragment() {
             pendingExeFsUri = uri
             // Step 2: choose RomFS separately. Cancelling opens an explicit skip
             // confirmation; it never accidentally launches a partially selected game.
-            getNs2RomFsFolder.launch(null)
+            launchNs2RomFsPicker()
         }
 
     private val getNs2RomFsFolder: ActivityResultLauncher<Uri?> =
@@ -156,7 +156,7 @@ class GamesFragment : Fragment() {
                     .setTitle(R.string.ns2_romfs_step_title)
                     .setMessage(R.string.ns2_romfs_skip_warning)
                     .setPositiveButton(R.string.ns2_choose_romfs) { _, _ ->
-                        getNs2RomFsFolder.launch(null)
+                        launchNs2RomFsPicker()
                     }
                     .setNeutralButton(R.string.ns2_skip_romfs) { _, _ ->
                         pendingExeFsUri = null
@@ -168,6 +168,12 @@ class GamesFragment : Fragment() {
                     .show()
             }
         }
+
+    // Keep the retry action outside the launcher's own initializer so Kotlin
+    // does not treat it as a reference to a property before initialization.
+    private fun launchNs2RomFsPicker() {
+        getNs2RomFsFolder.launch(null)
+    }
 
     private fun persistNs2ReadPermission(uri: Uri): Boolean {
         return try {
