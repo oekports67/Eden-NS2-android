@@ -1,30 +1,36 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
-
 package org.yuzu.yuzu_emu.utils
 
 import android.content.Context
 import android.net.Uri
 import android.os.SystemClock
-import androidx.documentfile.provider.DocumentFile
+import android.provider.DocumentsContract
 import java.io.DataInputStream
 import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
+import java.util.ArrayDeque
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.yuzu.yuzu_emu.getPublicFilesDir
 
 /**
- * Stage a selected SAF ExeFS + optional RomFS tree in app-controlled storage.
- *
- * A content:// document has no reliable POSIX parent directory, so passing only
- * exefs/main to the native RealVfsFile loses the neighbouring RomFS and NSOs.
- * The original source remains untouched. An interrupted import is never reused.
+ * Faster SAF import of extracted NS2 games, designed for 200,000+ loose files.
+ * Uses bulk directory queries, bounded concurrent copying and throttled progress.
+ * Does not alter input; stages atomically; cancellation cleans partial output.
  */
 object Ns2FolderImport {
     enum class Phase { SCANNING, COPYING, VERIFYING, CACHED, COMPLETE }
-
     data class ImportProgress(
         val phase: Phase,
         val filesCopied: Int = 0,
@@ -33,30 +39,145 @@ object Ns2FolderImport {
         val totalBytes: Long = 0,
         val currentFile: String = "",
         val percentage: Int? = null,
+        val scannedFiles: Int = 0,
+        val scannedFolders: Int = 0,
+        val bytesPerSecond: Long = 0,
     )
-
     data class ImportedGame(
         val mainPath: String,
         val romfsIncluded: Boolean,
         val reused: Boolean = false,
     )
 
+    // Same version/fingerprint as old importer, allowing safe reuse of complete cache.
     private const val MARKER_VERSION = "EDEN_NS2_IMPORT_V3_DUAL_TREE"
-    private const val BUFFER_SIZE = 256 * 1024
     private const val MAX_DEPTH = 64
+    private const val WORKERS = 4
+    private const val BUFFER_SIZE = 512 * 1024
+    private const val SCAN_REPORT_MS = 500L
+    private const val COPY_REPORT_MS = 350L
+    private val PROJECTION = arrayOf(
+        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+        DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+        DocumentsContract.Document.COLUMN_MIME_TYPE,
+        DocumentsContract.Document.COLUMN_SIZE,
+        DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+    )
 
-    private data class SourceFile(val source: DocumentFile, val path: String, val size: Long,
-                                  val modified: Long)
-
+    private data class Entry(
+        val id: String, val name: String, val mime: String,
+        val size: Long, val modified: Long,
+    ) {
+        val isDir: Boolean get() = mime == DocumentsContract.Document.MIME_TYPE_DIR
+    }
+    private data class Src(
+        val tree: Uri, val docId: String, val path: String,
+        val size: Long, val modified: Long,
+    )
+    private data class Dir(val id: String, val path: String, val depth: Int)
+    private data class Selection(val tree: Uri, val id: String)
     private class Plan {
-        val folders = linkedSetOf<String>()
-        val files = arrayListOf<SourceFile>()
-        var romfsIncluded = false
-        var completeMetadata = true
+        val dirs = linkedSetOf<String>()
+        val files = ArrayList<Src>()
+        private val paths = HashSet<String>()
         var totalBytes = 0L
+        var metadataComplete = true
+        var romfsIncluded = false
+
+        fun add(tree: Uri, e: Entry, path: String) {
+            if (!paths.add(path)) throw IOException("Duplicate source path: $path")
+            if (e.size <= 0L || e.modified <= 0L) metadataComplete = false
+            files.add(Src(tree, e.id, path, e.size, e.modified))
+            if (e.size > 0L) {
+                if (totalBytes > Long.MAX_VALUE - e.size) throw IOException("Game is too large")
+                totalBytes += e.size
+            }
+            if (path.startsWith("romfs/") || path.endsWith(".romfs", ignoreCase = true)) {
+                romfsIncluded = true
+            }
+        }
     }
 
-    /** Call on Dispatchers.IO. Progress callbacks may suspend (e.g. switch to Main). */
+    /** One bulk ContentResolver query per folder; no DocumentFile object per child. */
+    private suspend fun children(
+        context: Context, tree: Uri, folderId: String,
+        action: suspend (Entry) -> Unit,
+    ) {
+        val uri = DocumentsContract.buildChildDocumentsUriUsingTree(tree, folderId)
+        val cursor = context.contentResolver.query(uri, PROJECTION, null, null, null)
+            ?: throw IOException("Cannot list folder: SAF provider returned no cursor")
+        cursor.use { c ->
+            val idCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            val nameCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            val typeCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+            val sizeCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+            val timeCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+            if (idCol < 0 || nameCol < 0 || typeCol < 0) {
+                throw IOException("SAF document provider lacks required metadata")
+            }
+            val job = currentCoroutineContext()
+            var n = 0
+            while (c.moveToNext()) {
+                if (++n % 256 == 0) job.ensureActive()
+                val id = c.getString(idCol) ?: throw IOException("Missing SAF document ID")
+                val name = safeName(c.getString(nameCol))
+                val mime = c.getString(typeCol) ?: throw IOException("Missing SAF MIME type")
+                val size = if (sizeCol >= 0 && !c.isNull(sizeCol)) c.getLong(sizeCol) else 0L
+                val mtime = if (timeCol >= 0 && !c.isNull(timeCol)) c.getLong(timeCol) else 0L
+                action(Entry(id, name, mime, size, mtime))
+            }
+        }
+    }
+
+    private suspend fun named(
+        context: Context, root: Selection, vararg wanted: String,
+    ): Map<String, Entry> {
+        val result = HashMap<String, Entry>()
+        val names = wanted.toSet()
+        children(context, root.tree, root.id) { e -> if (e.name in names) result[e.name] = e }
+        return result
+    }
+
+    private fun folderName(context: Context, root: Selection): String? {
+        val uri = DocumentsContract.buildDocumentUriUsingTree(root.tree, root.id)
+        return context.contentResolver.query(
+            uri, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null
+        )?.use { c ->
+            val col = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            if (col >= 0 && c.moveToFirst()) c.getString(col) else null
+        }
+    }
+
+    private suspend fun scan(
+        context: Context, tree: Uri, rootId: String, prefix: String, plan: Plan,
+        fileCount: AtomicInteger, dirCount: AtomicInteger,
+        report: suspend (Boolean) -> Unit,
+    ) {
+        val queue = ArrayDeque<Dir>()
+        queue.addLast(Dir(rootId, prefix, 0))
+        while (!queue.isEmpty()) {
+            currentCoroutineContext().ensureActive()
+            val folder = queue.removeFirst()
+            if (folder.depth > MAX_DEPTH) throw IOException("Too many nested directories")
+            if (!plan.dirs.add(folder.path)) throw IOException("Duplicate directory: ${folder.path}")
+            dirCount.incrementAndGet()
+            children(context, tree, folder.id) { e ->
+                val path = when {
+                    folder.path == "romfs" && !e.isDir && e.name == "romfs" -> "romfs.romfs"
+                    folder.path == "romfs" && !e.isDir &&
+                        e.name.endsWith(".romfs", true) -> e.name
+                    else -> "${folder.path}/${e.name}"
+                }
+                if (e.isDir) queue.addLast(Dir(e.id, path, folder.depth + 1))
+                else {
+                    plan.add(tree, e, path)
+                    if (fileCount.incrementAndGet() % 128 == 0) report(false)
+                }
+            }
+            report(false)
+        }
+    }
+
     suspend fun import(
         context: Context,
         selectedExeFsUri: Uri,
@@ -64,122 +185,98 @@ object Ns2FolderImport {
         onProgress: suspend (ImportProgress) -> Unit = {},
     ): ImportedGame {
         currentCoroutineContext().ensureActive()
-        onProgress(ImportProgress(Phase.SCANNING))
-        val picked = DocumentFile.fromTreeUri(context, selectedExeFsUri)
-            ?: throw IOException("The selected folder could not be opened")
-        if (!picked.isDirectory) throw IOException("Select a folder, not a file")
-
-        val exefs = if (picked.findFile("main")?.isFile == true) picked
-                    else picked.findFile("exefs")
-        if (exefs == null || !exefs.isDirectory) {
-            throw IOException("exefs/main not found. Select the game root or the exefs folder")
-        }
-        val main = exefs.findFile("main")?.takeIf { it.isFile }
-            ?: throw IOException("exefs/main not found in the selected folder")
-        val magic = ByteArray(4)
-        context.contentResolver.openInputStream(main.uri)?.use { stream ->
-            try {
-                DataInputStream(stream).readFully(magic)
-            } catch (_: java.io.EOFException) {
-                throw IOException("exefs/main is truncated")
-            }
-        } ?: throw IOException("Cannot read exefs/main. Check access to the selected folder")
-        if (!magic.contentEquals("NSO0".toByteArray(Charsets.US_ASCII))) {
-            throw IOException("exefs/main is not an NSO (missing NSO0 header)")
-        }
-
         val plan = Plan()
-        suspend fun scan(dir: DocumentFile, relative: String, depth: Int) {
-            currentCoroutineContext().ensureActive()
-            if (depth > MAX_DEPTH) throw IOException("Too many nested directories")
-            plan.folders.add(relative)
-            for (child in dir.listFiles()) {
-                currentCoroutineContext().ensureActive()
-                val name = safeName(child.name)
-                // A RomFS image is a file, not a loose RomFS directory: the
-                // native loader expects it next to exefs/, not inside romfs/.
-                val path = if (relative == "romfs" && child.isFile &&
-                    name.endsWith(".romfs", ignoreCase = true)) name
-                    else "$relative/$name"
-                if (child.isDirectory) {
-                    scan(child, path, depth + 1)
-                } else if (child.isFile) {
-                    addFile(plan, child, path)
-                } else {
-                    throw IOException("Cannot read a file in $relative")
-                }
-            }
+        val filesFound = AtomicInteger(0)
+        val dirsFound = AtomicInteger(0)
+        var lastScanReport = 0L
+        suspend fun reportScan(force: Boolean) {
+            val now = SystemClock.elapsedRealtime()
+            if (!force && now - lastScanReport < SCAN_REPORT_MS) return
+            lastScanReport = now
+            onProgress(ImportProgress(
+                Phase.SCANNING, scannedFiles = filesFound.get(), scannedFolders = dirsFound.get()
+            ))
         }
+        reportScan(true)
 
-        scan(exefs, "exefs", 0)
-        // The second SAF picker can point to a RomFS directory that is completely
-        // separate from the ExeFS tree. Only the selected trees are read.
-        // Also accept the historical single-root layout when RomFS was skipped.
-        val romfsSelection = if (selectedRomFsUri != null) {
-            DocumentFile.fromTreeUri(context, selectedRomFsUri)
-                ?: throw IOException("The RomFS folder could not be opened")
-        } else if (picked.uri != exefs.uri) picked else null
-        if (romfsSelection != null) {
-            if (!romfsSelection.isDirectory) throw IOException("Select a RomFS folder")
-            if (romfsSelection.findFile("main")?.isFile == true ||
-                romfsSelection.name.equals("exefs", ignoreCase = true)) {
-                throw IOException("You selected ExeFS again. Choose the RomFS folder")
+        val selection = Selection(selectedExeFsUri, DocumentsContract.getTreeDocumentId(selectedExeFsUri))
+        val exRoot = named(context, selection, "main", "exefs")
+        val exeId = if (exRoot["main"]?.isDir == false) selection.id
+            else exRoot["exefs"]?.takeIf { it.isDir }?.id
+                ?: throw IOException("exefs/main not found: select ExeFS or game root")
+        val main = named(context, Selection(selectedExeFsUri, exeId), "main")["main"]
+            ?.takeIf { !it.isDir }
+            ?: throw IOException("exefs/main not found")
+        val mainUri = DocumentsContract.buildDocumentUriUsingTree(selectedExeFsUri, main.id)
+        val magic = ByteArray(4)
+        context.contentResolver.openInputStream(mainUri)?.use { input ->
+            try { DataInputStream(input).readFully(magic) }
+            catch (_: java.io.EOFException) { throw IOException("exefs/main is truncated") }
+        } ?: throw IOException("Cannot read exefs/main")
+        if (!magic.contentEquals("NSO0".toByteArray(Charsets.US_ASCII))) {
+            throw IOException("exefs/main is not NSO0")
+        }
+        scan(context, selectedExeFsUri, exeId, "exefs", plan, filesFound, dirsFound, ::reportScan)
+
+        val rom = when {
+            selectedRomFsUri != null -> Selection(
+                selectedRomFsUri, DocumentsContract.getTreeDocumentId(selectedRomFsUri))
+            exeId != selection.id -> selection
+            else -> null
+        }
+        if (rom != null) {
+            val romName = folderName(context, rom)
+            if (romName.equals("exefs", ignoreCase = true)) {
+                throw IOException("ExeFS was selected again; choose RomFS")
             }
-            val nested = romfsSelection.findFile("romfs")
-            val selectedGameRoot = romfsSelection.findFile("exefs")?.isDirectory == true
-            // Selecting a game root with a separate *.romfs image is valid,
-            // but the whole root must never be copied into romfs/ (that would
-            // recursively copy the ExeFS tree as game data).
-            val romfsDir = when {
-                nested?.isDirectory == true -> nested
-                selectedGameRoot -> null
-                else -> romfsSelection
+            // When RomFS is the chosen folder itself, avoid an extra full
+            // 200k-file directory listing merely to look for named children.
+            val meta = if (romName.equals("romfs", ignoreCase = true)) emptyMap()
+                       else named(context, rom, "main", "exefs", "romfs")
+            if (meta["main"]?.isDir == false) {
+                throw IOException("ExeFS was selected again; choose RomFS")
             }
-            if (nested?.isFile == true && nested.name == "romfs") {
-                addFile(plan, nested, "romfs.romfs")
+            val nested = meta["romfs"]
+            val gameRoot = meta["exefs"]?.isDir == true
+            val romId = when {
+                nested?.isDir == true -> nested.id
+                gameRoot -> null
+                else -> rom.id
             }
-            if (romfsDir != null && romfsDir.uri != exefs.uri) {
-                scan(romfsDir, "romfs", 0)
+            if (nested != null && !nested.isDir && nested.name == "romfs" && romId != rom.id) {
+                plan.add(rom.tree, nested, "romfs.romfs")
+                filesFound.incrementAndGet()
             }
-            // *.romfs, NACP and icon files can live at the selected root.
-            // Avoid duplicating entries already found in the RomFS directory.
-            for (entry in romfsSelection.listFiles()) {
-                currentCoroutineContext().ensureActive()
-                if (!entry.isFile || entry.uri == nested?.uri) continue
-                val name = safeName(entry.name)
-                if (name.endsWith(".romfs", ignoreCase = true) ||
-                    name.endsWith(".nacp", ignoreCase = true) ||
-                    name.startsWith("icon_", ignoreCase = true)) {
-                    if (plan.files.none { it.source.uri == entry.uri }) {
-                        addFile(plan, entry, name)
+            if (romId != null && !(rom.tree == selectedExeFsUri && romId == exeId)) {
+                scan(context, rom.tree, romId, "romfs", plan, filesFound, dirsFound, ::reportScan)
+            }
+            // Root metadata files accompanying a nested romfs/ or a game root.
+            if (romId != rom.id) {
+                children(context, rom.tree, rom.id) { e ->
+                    if (!e.isDir && e.id != nested?.id &&
+                        (e.name.endsWith(".romfs", true) ||
+                         e.name.endsWith(".nacp", true) ||
+                         e.name.startsWith("icon_", true))) {
+                        plan.add(rom.tree, e, e.name)
+                        filesFound.incrementAndGet()
                     }
                 }
             }
-            if (selectedRomFsUri != null && selectedGameRoot && romfsDir == null &&
-                plan.files.none { it.path.endsWith(".romfs", ignoreCase = true) }) {
-                throw IOException("No RomFS found in the selected game folder")
+            if (selectedRomFsUri != null && gameRoot && romId == null && !plan.romfsIncluded) {
+                throw IOException("No RomFS found in selected game folder")
             }
         }
-        plan.romfsIncluded = plan.files.any {
-            it.path.startsWith("romfs/") || it.path.endsWith(".romfs", ignoreCase = true)
-        }
+        reportScan(true)
         if (selectedRomFsUri != null && !plan.romfsIncluded) {
             throw IOException("Selected RomFS folder contains no readable files")
         }
-        if (plan.files.none { it.path == "exefs/main" }) {
-            throw IOException("Cannot locate exefs/main")
-        }
+        if (plan.files.none { it.path == "exefs/main" }) throw IOException("Missing exefs/main")
 
-        // Stable fingerprint includes all paths, file metadata and the chosen tree.
-        // SAF providers sometimes report size/mtime as 0. In that case do not reuse
-        // an old import, because we cannot establish that the source is unchanged.
         val digest = MessageDigest.getInstance("SHA-256")
-        fun hash(value: String) = digest.update(value.toByteArray(Charsets.UTF_8))
+        fun hash(text: String) { digest.update(text.toByteArray(Charsets.UTF_8)) }
         hash("$MARKER_VERSION\nExeFS:$selectedExeFsUri\nRomFS:${selectedRomFsUri ?: "auto"}\n")
-        plan.folders.sorted().forEach { hash("D:$it\n") }
-        plan.files.sortedBy { it.path }.forEach {
-            hash("F:${it.path}:${it.size}:${it.modified}\n")
-        }
+        plan.dirs.sorted().forEach { hash("D:$it\n") }
+        plan.files.sortedBy { it.path }.forEach { hash("F:${it.path}:${it.size}:${it.modified}\n") }
         val fingerprint = digest.digest().joinToString("") { "%02x".format(it) }
         val base = File(context.getPublicFilesDir(), "ns2_imports")
         if (!base.isDirectory && !base.mkdirs()) throw IOException("Cannot create import directory")
@@ -187,140 +284,142 @@ object Ns2FolderImport {
             .digest("$selectedExeFsUri\n${selectedRomFsUri ?: "auto"}".toByteArray(Charsets.UTF_8))
             .take(10).joinToString("") { "%02x".format(it) }
         val dest = File(base, key)
-        val mainDest = File(dest, "exefs/main")
         val marker = File(dest, ".ns2_import_complete")
-
-        if (plan.completeMetadata && marker.isFile && mainDest.isFile &&
+        val mainDest = File(dest, "exefs/main")
+        if (plan.metadataComplete && marker.isFile && mainDest.isFile &&
             marker.readText() == "$MARKER_VERSION\n$fingerprint\n" && verifyFiles(dest, plan)) {
             onProgress(ImportProgress(Phase.CACHED, plan.files.size, plan.files.size,
-                                      plan.totalBytes, plan.totalBytes, percentage = 100))
+                plan.totalBytes, plan.totalBytes, percentage = 100))
             return ImportedGame(mainDest.absolutePath, plan.romfsIncluded, reused = true)
         }
-
-        val available = base.usableSpace
-        // This checks the stated file sizes. Providers reporting unknown sizes may
-        // still exhaust storage; IO errors are surfaced instead of an incomplete boot.
-        if (available > 0 && plan.totalBytes > available - 64L * 1024 * 1024) {
-            throw IOException("Not enough free space to import game (need at least " +
-                              "${plan.totalBytes / (1024 * 1024)} MiB)")
+        if (base.usableSpace > 0 && plan.totalBytes > base.usableSpace - 64L * 1024 * 1024) {
+            throw IOException("Insufficient space: need at least ${plan.totalBytes / 1048576} MiB")
         }
-
-        // Earlier failed attempts must not be recognized as completed imports.
+        // Old unfinished staging folders are never accepted as imports.
         base.listFiles()?.filter {
             it.name.startsWith(".$key-") && it.name.endsWith(".partial")
         }?.forEach { it.deleteRecursively() }
-        val temp = File(base, ".$key-${System.nanoTime()}.partial")
-        if (!temp.mkdirs()) throw IOException("Cannot create temporary import folder")
-        val expectedSizes = HashMap<String, Long>()
-        var copiedBytes = 0L
-        var copiedFiles = 0
-        var lastUpdate = 0L
-        val sizeBasedProgress = plan.completeMetadata && plan.totalBytes > 0L
+        val stage = File(base, ".$key-${System.nanoTime()}.partial")
+        if (!stage.mkdirs()) throw IOException("Cannot create staging directory")
 
-        suspend fun progress(force: Boolean, file: String = "") {
+        val sizes = LongArray(plan.files.size)
+        val copiedBytes = AtomicLong(0)
+        val copiedFiles = AtomicInteger(0)
+        val lastCopyReport = AtomicLong(0)
+        val progressMutex = Mutex()
+        val startedAt = SystemClock.elapsedRealtime()
+        suspend fun reportCopy(force: Boolean = false, file: String = "") {
             val now = SystemClock.elapsedRealtime()
-            if (!force && now - lastUpdate < 180L) return
-            lastUpdate = now
-            val percentage = if (sizeBasedProgress) {
-                // 100% only after all output files have been verified.
-                ((copiedBytes.coerceAtMost(plan.totalBytes) * 99) / plan.totalBytes).toInt()
-            } else null
-            onProgress(ImportProgress(Phase.COPYING, copiedFiles, plan.files.size,
-                                      copiedBytes, plan.totalBytes, file, percentage))
+            if (!force) {
+                val before = lastCopyReport.get()
+                if (now - before < COPY_REPORT_MS ||
+                    !lastCopyReport.compareAndSet(before, now)) return
+            } else lastCopyReport.set(now)
+            progressMutex.withLock {
+                val bytes = copiedBytes.get()
+                val percent = if (plan.metadataComplete && plan.totalBytes > 0) {
+                    ((bytes.coerceAtMost(plan.totalBytes) * 99) / plan.totalBytes).toInt()
+                } else null
+                val elapsed = (SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(1)
+                onProgress(ImportProgress(
+                    Phase.COPYING, copiedFiles.get(), plan.files.size,
+                    bytes, plan.totalBytes, file, percent,
+                    filesFound.get(), dirsFound.get(), bytes * 1000L / elapsed,
+                ))
+            }
         }
-
         try {
-            for (folder in plan.folders) {
+            for (dir in plan.dirs) {
                 currentCoroutineContext().ensureActive()
-                if (!File(temp, folder).isDirectory && !File(temp, folder).mkdirs()) {
-                    throw IOException("Cannot create $folder in import directory")
+                val output = File(stage, dir)
+                if (!output.isDirectory && !output.mkdirs()) {
+                    throw IOException("Cannot create directory $dir")
                 }
             }
-            progress(force = true)
-            for (entry in plan.files) {
-                currentCoroutineContext().ensureActive()
-                val target = File(temp, entry.path)
-                val input = context.contentResolver.openInputStream(entry.source.uri)
-                    ?: throw IOException("Cannot read ${entry.path} from selected folder")
-                var written = 0L
-                input.use { stream ->
-                    target.outputStream().use { output ->
+            reportCopy(true)
+            // Four bounded workers hide SAF open() latency for small files.
+            // A shared buffer PER worker avoids allocating one for each file.
+            coroutineScope {
+                val jobs = Channel<Int>(capacity = 64)
+                val workers = List(WORKERS) {
+                    launch(Dispatchers.IO) {
                         val buffer = ByteArray(BUFFER_SIZE)
-                        while (true) {
+                        for (index in jobs) {
                             currentCoroutineContext().ensureActive()
-                            val count = stream.read(buffer)
-                            if (count == -1) break
-                            if (count == 0) continue
-                            output.write(buffer, 0, count)
-                            written += count
-                            copiedBytes += count
-                            progress(force = false, file = entry.path)
+                            val src = plan.files[index]
+                            val sourceUri = DocumentsContract.buildDocumentUriUsingTree(src.tree, src.docId)
+                            val input = context.contentResolver.openInputStream(sourceUri)
+                                ?: throw IOException("Cannot read ${src.path}")
+                            val output = File(stage, src.path)
+                            var n = 0L
+                            input.use { stream ->
+                                output.outputStream().use { out ->
+                                    while (true) {
+                                        currentCoroutineContext().ensureActive()
+                                        val count = stream.read(buffer)
+                                        if (count == -1) break
+                                        if (count == 0) continue
+                                        out.write(buffer, 0, count)
+                                        n += count
+                                        copiedBytes.addAndGet(count.toLong())
+                                        reportCopy(file = src.path)
+                                    }
+                                }
+                            }
+                            if (src.size > 0 && src.size != n) {
+                                throw IOException("Source file changed during copy: ${src.path}")
+                            }
+                            if (output.length() != n) throw IOException("Incomplete copy: ${src.path}")
+                            sizes[index] = n
+                            copiedFiles.incrementAndGet()
+                            reportCopy(file = src.path)
                         }
                     }
                 }
-                if (entry.size > 0 && entry.size != written) {
-                    throw IOException("File size changed while importing ${entry.path}")
-                }
-                if (target.length() != written) throw IOException("Incomplete copy: ${entry.path}")
-                expectedSizes[entry.path] = written
-                copiedFiles++
-                progress(force = true, file = entry.path)
+                try {
+                    for (i in plan.files.indices) jobs.send(i)
+                } finally { jobs.close() }
+                workers.joinAll()
             }
-            onProgress(ImportProgress(Phase.VERIFYING, copiedFiles, plan.files.size,
-                                      copiedBytes, plan.totalBytes))
-            for ((relative, size) in expectedSizes) {
-                currentCoroutineContext().ensureActive()
-                val output = File(temp, relative)
-                if (!output.isFile || output.length() != size) {
-                    throw IOException("Imported file missing or truncated: $relative")
+            onProgress(ImportProgress(Phase.VERIFYING, copiedFiles.get(), plan.files.size,
+                copiedBytes.get(), plan.totalBytes))
+            for (i in plan.files.indices) {
+                if (i % 256 == 0) currentCoroutineContext().ensureActive()
+                val e = plan.files[i]
+                val f = File(stage, e.path)
+                if (!f.isFile || f.length() != sizes[i]) {
+                    throw IOException("Imported file missing or truncated: ${e.path}")
                 }
             }
-            // Verify the imported main header, not just the original source header.
-            File(temp, "exefs/main").inputStream().use { stream ->
+            File(stage, "exefs/main").inputStream().use { input ->
                 val header = ByteArray(4)
-                DataInputStream(stream).readFully(header)
+                DataInputStream(input).readFully(header)
                 if (!header.contentEquals(magic)) throw IOException("Copied NSO header mismatch")
             }
-            File(temp, ".ns2_import_complete").writeText("$MARKER_VERSION\n$fingerprint\n")
-
-            // Atomic replacement with rollback if final rename fails. Avoid losing
-            // the previous complete import when a new import cannot be installed.
+            File(stage, ".ns2_import_complete").writeText("$MARKER_VERSION\n$fingerprint\n")
             val backup = File(base, ".$key-${System.nanoTime()}.backup")
-            val hadPrevious = dest.exists()
-            if (hadPrevious && !dest.renameTo(backup)) {
-                throw IOException("Cannot replace previous import. Close running games")
+            val previous = dest.exists()
+            if (previous && !dest.renameTo(backup)) {
+                throw IOException("Cannot replace previous import; close running game")
             }
-            if (!temp.renameTo(dest)) {
-                if (hadPrevious) backup.renameTo(dest)
-                throw IOException("Cannot finalize imported game folder")
+            if (!stage.renameTo(dest)) {
+                if (previous) backup.renameTo(dest)
+                throw IOException("Cannot finalize import")
             }
-            if (hadPrevious) backup.deleteRecursively()
-            onProgress(ImportProgress(Phase.COMPLETE, copiedFiles, plan.files.size,
-                                      copiedBytes, plan.totalBytes, percentage = 100))
+            if (previous) backup.deleteRecursively()
+            onProgress(ImportProgress(Phase.COMPLETE, copiedFiles.get(), plan.files.size,
+                copiedBytes.get(), plan.totalBytes, percentage = 100))
             return ImportedGame(File(dest, "exefs/main").absolutePath, plan.romfsIncluded)
         } finally {
-            if (temp.exists()) temp.deleteRecursively()
+            if (stage.exists()) stage.deleteRecursively()
         }
     }
 
-    private fun addFile(plan: Plan, source: DocumentFile, path: String) {
-        val size = source.length()
-        val modified = source.lastModified()
-        if (size <= 0 || modified <= 0) plan.completeMetadata = false
-        plan.files.add(SourceFile(source, path, size, modified))
-        if (size > 0) {
-            if (Long.MAX_VALUE - plan.totalBytes < size) {
-                throw IOException("The selected game is too large")
-            }
-            plan.totalBytes += size
-        }
-    }
-
-    private suspend fun verifyFiles(folder: File, plan: Plan): Boolean {
-        for (entry in plan.files) {
-            currentCoroutineContext().ensureActive()
-            val target = File(folder, entry.path)
-            if (!target.isFile || target.length() != entry.size) return false
+    private suspend fun verifyFiles(base: File, plan: Plan): Boolean {
+        for ((i, entry) in plan.files.withIndex()) {
+            if (i % 256 == 0) currentCoroutineContext().ensureActive()
+            val file = File(base, entry.path)
+            if (!file.isFile || file.length() != entry.size) return false
         }
         return true
     }
@@ -328,7 +427,7 @@ object Ns2FolderImport {
     private fun safeName(name: String?): String {
         if (name.isNullOrBlank() || name == "." || name == ".." ||
             name.contains('/') || name.contains('\\') || name.contains('\u0000')) {
-            throw IOException("Invalid file or directory name inside game folder")
+            throw IOException("Invalid file or directory name")
         }
         return name
     }

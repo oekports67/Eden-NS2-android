@@ -215,17 +215,39 @@ class GamesFragment : Fragment() {
                                 progress.progress = update.percentage
                             }
                             val status = when (update.phase) {
-                                Ns2FolderImport.Phase.SCANNING -> getString(R.string.ns2_phase_scanning)
+                                Ns2FolderImport.Phase.SCANNING -> {
+                                    val details = if (Locale.getDefault().language == "ru") {
+                                        "Найдено файлов: ${update.scannedFiles} · Папок: ${update.scannedFolders}"
+                                    } else {
+                                        "Files found: ${update.scannedFiles} · Folders: ${update.scannedFolders}"
+                                    }
+                                    "${getString(R.string.ns2_phase_scanning)}\n$details"
+                                }
                                 Ns2FolderImport.Phase.VERIFYING -> getString(R.string.ns2_phase_verifying)
                                 Ns2FolderImport.Phase.CACHED -> getString(R.string.ns2_phase_cached)
                                 Ns2FolderImport.Phase.COMPLETE -> getString(R.string.ns2_phase_complete)
-                                Ns2FolderImport.Phase.COPYING -> getString(
-                                    R.string.ns2_phase_copying,
-                                    update.filesCopied,
-                                    update.totalFiles,
-                                    update.bytesCopied / (1024 * 1024),
-                                    update.totalBytes / (1024 * 1024),
-                                )
+                                Ns2FolderImport.Phase.COPYING -> {
+                                    val basic = getString(
+                                        R.string.ns2_phase_copying,
+                                        update.filesCopied,
+                                        update.totalFiles,
+                                        update.bytesCopied / (1024 * 1024),
+                                        update.totalBytes / (1024 * 1024),
+                                    )
+                                    val speed = update.bytesPerSecond / (1024.0 * 1024.0)
+                                    val unit = if (Locale.getDefault().language == "ru") "МиБ/с" else "MiB/s"
+                                    val rate = String.format(Locale.getDefault(), "%.1f %s", speed, unit)
+                                    val remaining = if (update.percentage != null &&
+                                        update.bytesPerSecond > 0L &&
+                                        update.totalBytes > update.bytesCopied) {
+                                        (update.totalBytes - update.bytesCopied) / update.bytesPerSecond
+                                    } else -1L
+                                    val eta = if (remaining >= 0L) {
+                                        val prefix = if (Locale.getDefault().language == "ru") "Осталось" else "ETA"
+                                        " · $prefix ~${(remaining + 59) / 60} мин"
+                                    } else ""
+                                    "$basic\n$rate$eta"
+                                }
                             }
                             progressDialog.setMessage(status)
                         }
